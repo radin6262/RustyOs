@@ -1,0 +1,1042 @@
+use core::{
+    alloc::{
+        GlobalAlloc,
+        Layout,
+    },
+    cell::UnsafeCell,
+    mem::MaybeUninit,
+    ptr::null_mut,
+    sync::atomic::{
+        AtomicU8,
+        AtomicU64,
+        AtomicUsize,
+        Ordering,
+    },
+};
+
+use bootloader_api::info::{
+    BootInfo,
+    MemoryRegionKind,
+};
+
+use x86_64::{
+    PhysAddr,
+    VirtAddr,
+    registers::control::Cr3,
+    structures::paging::{
+        mapper::MapToError,
+        FrameAllocator,
+        Mapper,
+        OffsetPageTable,
+        Page,
+        PageSize,
+        PageTable,
+        PageTableFlags,
+        PhysFrame,
+        Size2MiB,
+        Size4KiB,
+        Translate,
+    },
+};
+
+// ============================================================
+// Memory layout
+// ============================================================
+
+const MIN_ALLOCATOR_ADDRESS: u64 =
+    0x10_0000;
+
+// Reserve this much physical memory for
+// page-table allocations.
+const PAGE_TABLE_RESERVE_SIZE: u64 =
+    4 * 1024 * 1024;
+
+// Dedicated identity-mapped region used for:
+// - kernel heap
+// - DMA
+// - userspace physical frames
+const DMA_REGION_SIZE: u64 =
+    128 * 1024 * 1024;
+
+const LARGE_PAGE_SIZE: u64 =
+    Size2MiB::SIZE;
+
+// ============================================================
+// Global allocator
+// ============================================================
+
+struct KernelAllocator {
+    start: AtomicUsize,
+    end: AtomicUsize,
+    initialized: AtomicU8,
+}
+
+impl KernelAllocator {
+    const fn new() -> Self {
+        Self {
+            start: AtomicUsize::new(0),
+            end: AtomicUsize::new(0),
+            initialized: AtomicU8::new(0),
+        }
+    }
+}
+
+unsafe impl GlobalAlloc
+for KernelAllocator
+{
+    unsafe fn alloc(
+        &self,
+        layout: Layout,
+    ) -> *mut u8 {
+        if self.initialized.load(
+            Ordering::Acquire,
+        ) == 0 {
+            return null_mut();
+        }
+
+        let alignment =
+            layout.align();
+
+        let mut current =
+            self.start.load(
+                Ordering::Relaxed,
+            );
+
+        let end =
+            self.end.load(
+                Ordering::Acquire,
+            );
+
+        loop {
+            let aligned =
+                match current
+                    .checked_add(
+                        alignment - 1,
+                    )
+                {
+                    Some(value) =>
+                        value
+                            & !(alignment - 1),
+
+                    None =>
+                        return null_mut(),
+                };
+
+            let next =
+                match aligned
+                    .checked_add(
+                        layout.size(),
+                    )
+                {
+                    Some(value) =>
+                        value,
+
+                    None =>
+                        return null_mut(),
+                };
+
+            if next > end {
+                return null_mut();
+            }
+
+            match self.start.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    //
+                    // The heap is identity mapped:
+                    //
+                    //     VA == PA
+                    //
+                    return aligned
+                        as *mut u8;
+                }
+
+                Err(actual) => {
+                    current = actual;
+                }
+            }
+        }
+    }
+
+    unsafe fn dealloc(
+        &self,
+        _ptr: *mut u8,
+        _layout: Layout,
+    ) {
+        //
+        // Bump allocator.
+        //
+        // Nothing is reclaimed yet.
+        //
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR:
+KernelAllocator =
+    KernelAllocator::new();
+
+// ============================================================
+// Physical memory offset
+// ============================================================
+
+static PHYSICAL_MEMORY_OFFSET:
+AtomicU64 =
+    AtomicU64::new(0);
+
+// ============================================================
+// Mapper storage
+// ============================================================
+
+struct MapperStorage {
+    mapper: UnsafeCell<
+        MaybeUninit<
+            OffsetPageTable<'static>,
+        >,
+    >,
+}
+
+unsafe impl Sync
+for MapperStorage
+{
+}
+
+impl MapperStorage {
+    const fn new() -> Self {
+        Self {
+            mapper: UnsafeCell::new(
+                MaybeUninit::uninit(),
+            ),
+        }
+    }
+}
+
+static MAPPER:
+MapperStorage =
+    MapperStorage::new();
+
+static MAPPER_READY:
+AtomicU8 =
+    AtomicU8::new(0);
+
+// ============================================================
+// Page-table frame allocator
+// ============================================================
+//
+// The first 4 MiB of the selected region are reserved
+// exclusively for creating additional page tables.
+//
+// They are never returned by the kernel heap.
+// ============================================================
+
+static PAGE_TABLE_NEXT:
+AtomicU64 =
+    AtomicU64::new(0);
+
+static PAGE_TABLE_END:
+AtomicU64 =
+    AtomicU64::new(0);
+
+struct PageTableFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB>
+for PageTableFrameAllocator
+{
+    fn allocate_frame(
+        &mut self,
+    ) -> Option<
+        PhysFrame<Size4KiB>
+    > {
+        loop {
+            let current =
+                PAGE_TABLE_NEXT.fetch_add(
+                    Size4KiB::SIZE,
+                    Ordering::AcqRel,
+                );
+
+            let end =
+                PAGE_TABLE_END.load(
+                    Ordering::Acquire,
+                );
+
+            if current >= end {
+                return None;
+            }
+
+            if current
+                .checked_add(
+                    Size4KiB::SIZE,
+                )
+                .is_none()
+            {
+                return None;
+            }
+
+            return Some(
+                PhysFrame::<Size4KiB>
+                ::containing_address(
+                    PhysAddr::new(
+                        current,
+                    ),
+                ),
+            );
+        }
+    }
+}
+
+
+// ============================================================
+// Mapper access
+// ============================================================
+
+pub unsafe fn mapper_mut()
+    -> &'static mut OffsetPageTable<'static>
+{
+    if MAPPER_READY.load(
+        Ordering::Acquire,
+    ) == 0 {
+        panic!(
+            "Rusty: page mapper not initialized",
+        );
+    }
+
+    unsafe {
+        &mut *(
+            (*MAPPER.mapper.get())
+                .as_mut_ptr()
+        )
+    }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+fn align_up(
+    value: u64,
+    alignment: u64,
+) -> Option<u64> {
+    value
+        .checked_add(
+            alignment - 1,
+        )
+        .map(|value|
+            value
+                & !(alignment - 1)
+        )
+}
+
+fn find_dma_region(
+    boot_info: &BootInfo,
+) -> Option<(u64, u64)>
+{
+    let required =
+        PAGE_TABLE_RESERVE_SIZE
+            + DMA_REGION_SIZE;
+
+    for region
+    in boot_info.memory_regions.iter()
+    {
+        if region.kind
+            != MemoryRegionKind::Usable
+        {
+            continue;
+        }
+
+        let minimum_start =
+            region.start.max(
+                MIN_ALLOCATOR_ADDRESS,
+            );
+
+        let start =
+            align_up(
+                minimum_start,
+                LARGE_PAGE_SIZE,
+            )?;
+
+        let end =
+            start.checked_add(
+                required,
+            )?;
+
+        if end <= region.end {
+            return Some((
+                start,
+                end,
+            ));
+        }
+    }
+
+    None
+}
+
+// ============================================================
+// Page-table initialization
+// ============================================================
+
+unsafe fn init_mapper(
+    boot_info: &BootInfo,
+) {
+    let physical_offset =
+        boot_info
+            .physical_memory_offset
+            .into_option()
+            .expect(
+                "Rusty: physical memory mapping unavailable",
+            );
+
+    PHYSICAL_MEMORY_OFFSET.store(
+        physical_offset,
+        Ordering::Release,
+    );
+
+    let (
+        level_4_frame,
+        _,
+    ) =
+        Cr3::read();
+
+    let level_4_physical =
+        level_4_frame
+            .start_address()
+            .as_u64();
+
+    let level_4_virtual =
+        physical_offset
+            .checked_add(
+                level_4_physical,
+            )
+            .expect(
+                "Rusty: L4 virtual address overflow",
+            );
+
+    let level_4_table =
+        level_4_virtual
+            as *mut PageTable;
+
+    let level_4_table:
+        &'static mut PageTable =
+        unsafe {
+            &mut *level_4_table
+        };
+
+    let mapper =
+        unsafe {
+            OffsetPageTable::new(
+                level_4_table,
+                VirtAddr::new(
+                    physical_offset,
+                ),
+            )
+        };
+
+    unsafe {
+        (*MAPPER.mapper.get())
+            .write(mapper);
+    }
+
+    MAPPER_READY.store(
+        1,
+        Ordering::Release,
+    );
+}
+
+// ============================================================
+// Identity-map one 2 MiB page
+// ============================================================
+
+fn identity_map_2m(
+    physical: u64,
+) -> bool {
+    let virtual_address =
+        VirtAddr::new(
+            physical,
+        );
+
+    unsafe {
+        let mapper =
+            mapper_mut();
+
+        //
+        // If it is already identity mapped,
+        // nothing needs to be done.
+        //
+        if let Some(mapped) =
+            mapper.translate_addr(
+                virtual_address,
+            )
+        {
+            return mapped.as_u64()
+                == physical;
+        }
+
+        let page =
+            Page::<Size2MiB>
+            ::from_start_address(
+                virtual_address,
+            )
+                .expect(
+                    "Rusty: invalid 2 MiB virtual page",
+                );
+
+        let frame =
+            PhysFrame::<Size2MiB>
+            ::from_start_address(
+                PhysAddr::new(
+                    physical,
+                ),
+            )
+                .expect(
+                    "Rusty: invalid 2 MiB physical frame",
+                );
+
+        let flags =
+            PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::NO_EXECUTE;
+
+        let mut frame_allocator =
+            PageTableFrameAllocator;
+
+        match mapper.identity_map(
+            frame,
+            flags,
+            &mut frame_allocator,
+        ) {
+            Ok(flush) => {
+                flush.flush();
+                true
+            }
+
+            Err(_) => false,
+        }
+    }
+}
+
+// ============================================================
+// Identity-map MMIO
+// ============================================================
+
+pub unsafe fn identity_map_mmio(
+    address: usize,
+    size: usize,
+) {
+    if size == 0 {
+        return;
+    }
+
+    let start =
+        (address as u64)
+            & !(Size4KiB::SIZE - 1);
+
+    let end_unaligned =
+        (address as u64)
+            .checked_add(
+                size as u64,
+            )
+            .expect(
+                "Rusty: MMIO range overflow",
+            );
+
+    let end =
+        align_up(
+            end_unaligned,
+            Size4KiB::SIZE,
+        )
+            .expect(
+                "Rusty: MMIO alignment overflow",
+            );
+
+    let mut physical =
+        start;
+
+    while physical < end {
+        unsafe {
+            let mapper =
+                mapper_mut();
+
+            if let Some(mapped) =
+                mapper.translate_addr(
+                    VirtAddr::new(
+                        physical,
+                    ),
+                )
+            {
+                if mapped.as_u64()
+                    != physical
+                {
+                    panic!(
+                        "Rusty: MMIO virtual address collision",
+                    );
+                }
+            } else {
+                let page =
+                    Page::<Size4KiB>
+                    ::from_start_address(
+                        VirtAddr::new(
+                            physical,
+                        ),
+                    )
+                        .expect(
+                            "Rusty: invalid MMIO page",
+                        );
+
+                let frame =
+                    PhysFrame::<Size4KiB>
+                    ::from_start_address(
+                        PhysAddr::new(
+                            physical,
+                        ),
+                    )
+                        .expect(
+                            "Rusty: invalid MMIO frame",
+                        );
+
+                let flags =
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::NO_EXECUTE
+                        | PageTableFlags::NO_CACHE;
+
+                let mut frame_allocator =
+                    PageTableFrameAllocator;
+
+                mapper
+                    .map_to(
+                        page,
+                        frame,
+                        flags,
+                        &mut frame_allocator,
+                    )
+                    .expect(
+                        "Rusty: failed to identity-map xHCI MMIO",
+                    )
+                    .flush();
+            }
+        }
+
+        physical +=
+            Size4KiB::SIZE;
+    }
+}
+
+// ============================================================
+// Main initialization
+// ============================================================
+
+pub fn init(
+    boot_info: &BootInfo,
+) {
+    unsafe {
+        init_mapper(
+            boot_info,
+        );
+    }
+
+    let Some((
+                 region_start,
+                 region_end,
+             )) =
+        find_dma_region(
+            boot_info,
+        )
+    else {
+        panic!(
+            "Rusty: no usable 128 MiB DMA region found",
+        );
+    };
+
+    // ========================================================
+    // Page-table reserve
+    // ========================================================
+
+    let page_table_start =
+        region_start;
+
+    let page_table_end =
+        page_table_start
+            + PAGE_TABLE_RESERVE_SIZE;
+
+    PAGE_TABLE_NEXT.store(
+        page_table_start,
+        Ordering::Release,
+    );
+
+    PAGE_TABLE_END.store(
+        page_table_end,
+        Ordering::Release,
+    );
+
+    // ========================================================
+    // Identity-map DMA / heap
+    // ========================================================
+
+    let dma_start =
+        page_table_end;
+
+    let dma_end =
+        region_end;
+
+    let mut physical =
+        dma_start;
+
+    while physical < dma_end {
+        if !identity_map_2m(
+            physical,
+        ) {
+            panic!(
+                "Rusty: could not identity-map DMA memory",
+            );
+        }
+
+        physical +=
+            LARGE_PAGE_SIZE;
+    }
+
+    // ========================================================
+    // Initialize kernel heap
+    // ========================================================
+
+    ALLOCATOR.start.store(
+        dma_start as usize,
+        Ordering::Release,
+    );
+
+    ALLOCATOR.end.store(
+        dma_end as usize,
+        Ordering::Release,
+    );
+
+    ALLOCATOR.initialized.store(
+        1,
+        Ordering::Release,
+    );
+}
+
+// ============================================================
+// Physical memory API
+// ============================================================
+
+pub fn physical_memory_offset()
+    -> u64
+{
+    PHYSICAL_MEMORY_OFFSET.load(
+        Ordering::Acquire,
+    )
+}
+
+// ============================================================
+// Physical → virtual
+// ============================================================
+
+pub fn physical_to_virtual(
+    physical: u64,
+) -> *mut u8 {
+    let offset =
+        physical_memory_offset();
+
+    let virtual_address =
+        offset
+            .checked_add(
+                physical,
+            )
+            .expect(
+                "Rusty: physical-to-virtual overflow",
+            );
+
+    virtual_address as *mut u8
+}
+
+// ============================================================
+// Virtual → physical
+// ============================================================
+//
+// This is useful when constructing page tables or
+// preparing user-space mappings.
+//
+
+// ============================================================
+// Virtual → physical
+// ============================================================
+
+pub fn virtual_to_physical(
+    virtual_address: u64,
+) -> Option<u64> {
+    if !mapper_ready() {
+        return None;
+    }
+
+    let mapper =
+        unsafe {
+            mapper_mut()
+        };
+
+    mapper
+        .translate_addr(
+            VirtAddr::new(
+                virtual_address,
+            ),
+        )
+        .map(|physical|
+            physical.as_u64()
+        )
+}
+
+// ============================================================
+// Current kernel PML4
+// ============================================================
+
+pub fn current_level_4_frame()
+    -> PhysFrame<Size4KiB>
+{
+    let (
+        frame,
+        _,
+    ) =
+        Cr3::read();
+
+    frame
+}
+
+// ============================================================
+// Allocate a zeroed physical frame
+// ============================================================
+//
+// This uses the existing identity-mapped kernel heap.
+//
+// The frame is:
+// - physically addressable
+// - identity mapped
+// - zero initialized
+//
+// It is intentionally not reclaimed yet.
+//
+
+pub fn allocate_frame()
+    -> Option<PhysFrame<Size4KiB>>
+{
+    let layout =
+        Layout::from_size_align(
+            Size4KiB::SIZE as usize,
+            Size4KiB::SIZE as usize,
+        )
+            .ok()?;
+
+    let pointer =
+        unsafe {
+            ALLOCATOR.alloc(
+                layout,
+            )
+        };
+
+    if pointer.is_null() {
+        return None;
+    }
+
+    unsafe {
+        core::ptr::write_bytes(
+            pointer,
+            0,
+            Size4KiB::SIZE as usize,
+        );
+    }
+
+    Some(
+        PhysFrame::<Size4KiB>
+        ::containing_address(
+            PhysAddr::new(
+                pointer as u64,
+            ),
+        ),
+    )
+}
+pub fn allocate_user_frame()
+    -> Option<PhysFrame<Size4KiB>>
+{
+    allocate_frame()
+}
+
+// ============================================================
+// Zero a physical frame
+// ============================================================
+
+pub fn zero_frame(
+    frame: PhysFrame<Size4KiB>,
+) {
+    let pointer =
+        physical_to_virtual(
+            frame
+                .start_address()
+                .as_u64(),
+        );
+
+    unsafe {
+        core::ptr::write_bytes(
+            pointer,
+            0,
+            Size4KiB::SIZE as usize,
+        );
+    }
+}
+
+// ============================================================
+// Copy bytes into a physical frame
+// ============================================================
+
+pub fn copy_to_frame(
+    frame: PhysFrame<Size4KiB>,
+    data: &[u8],
+) {
+    assert!(
+        data.len()
+            <= Size4KiB::SIZE as usize,
+        "Rusty: frame copy overflow",
+    );
+
+    let destination =
+        physical_to_virtual(
+            frame
+                .start_address()
+                .as_u64(),
+        );
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            destination,
+            data.len(),
+        );
+    }
+}
+
+// ============================================================
+// Create a new user page-table frame
+// ============================================================
+//
+// This is intentionally separated from allocate_frame()
+// semantically so the userspace code is clearer.
+//
+
+pub fn allocate_page_table_frame()
+    -> Option<PhysFrame<Size4KiB>>
+{
+    allocate_frame()
+}
+
+// ============================================================
+// Map a single user page
+// ============================================================
+
+pub unsafe fn map_user_page(
+    mapper:
+    &mut OffsetPageTable<'static>,
+
+    virtual_address:
+    VirtAddr,
+
+    physical_frame:
+    PhysFrame<Size4KiB>,
+
+    writable:
+    bool,
+
+    executable:
+    bool,
+) {
+    let mut flags =
+        PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE;
+
+    if writable {
+        flags |=
+            PageTableFlags::WRITABLE;
+    }
+
+    if !executable {
+        flags |=
+            PageTableFlags::NO_EXECUTE;
+    }
+
+    let page =
+        Page::<Size4KiB>
+        ::containing_address(
+            virtual_address,
+        );
+
+    let mut frame_allocator =
+        PageTableFrameAllocator;
+
+    unsafe {
+        mapper
+            .map_to(
+                page,
+                physical_frame,
+                flags,
+                &mut frame_allocator,
+            )
+            .expect(
+                "Rusty: failed to map user page",
+            )
+            .flush();
+    }
+}
+
+// ============================================================
+// Unmap a page
+// ============================================================
+
+pub unsafe fn unmap_page(
+    mapper:
+    &mut OffsetPageTable<'static>,
+
+    virtual_address:
+    VirtAddr,
+) {
+    let page =
+        Page::<Size4KiB>
+        ::containing_address(
+            virtual_address,
+        );
+
+    unsafe {
+        if let Ok((
+                      _frame,
+                      flush,
+                  )) =
+            mapper.unmap(
+                page,
+            )
+        {
+            flush.flush();
+        }
+    }
+}
+
+// ============================================================
+// Allocator status
+// ============================================================
+
+pub fn allocator_ready()
+    -> bool
+{
+    ALLOCATOR.initialized.load(
+        Ordering::Acquire,
+    ) != 0
+}
+
+// ============================================================
+// Mapper status
+// ============================================================
+
+pub fn mapper_ready()
+    -> bool
+{
+    MAPPER_READY.load(
+        Ordering::Acquire,
+    ) != 0
+}
+
