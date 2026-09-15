@@ -1,3 +1,5 @@
+mod boothandler;
+
 use bootloader_api::info::FrameBuffer;
 
 use crate::{

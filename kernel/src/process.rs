@@ -18,7 +18,7 @@ use x86_64::{
     VirtAddr,
 };
 
-use crate::{
+pub use crate::{
     cpu::gdt::Selectors,
     user::{
         address_space::UserAddressSpace,

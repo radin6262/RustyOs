@@ -9,6 +9,7 @@ use x86_64::{
     VirtAddr,
 };
 
+use crate::graphics::Color;
 use crate::process::{
     SavedUserContext,
     ScheduleResult,
@@ -25,6 +26,16 @@ pub const SYS_TEST: u64 = 3;
 pub const SYS_WRITE: u64 = 4;
 pub const SYS_READ: u64 = 5;
 pub const SYS_SLEEP: u64 = 6;
+
+// Primitive Window UI Syscalls
+pub const SYS_FILL_RECT: u64 = 7;
+pub const SYS_DRAW_STRING: u64 = 8;
+pub const SYS_DRAW_RECT: u64 = 9;
+
+// Window Manager Syscalls
+pub const SYS_CREATE_WINDOW: u64 = 100;
+pub const SYS_UPDATE_WINDOW: u64 = 101;
+pub const SYS_FLUSH_SCREEN: u64 = 102;
 
 const ENOSYS: u64 = u64::MAX;
 const SUCCESS: u64 = 0;
@@ -344,6 +355,34 @@ extern "C" fn rusty_syscall_dispatch(
                 frame,
             ),
 
+        SYS_FILL_RECT =>
+            syscall_fill_rect(
+                frame,
+            ),
+
+        SYS_DRAW_STRING =>
+            syscall_draw_string(
+                frame,
+            ),
+
+        SYS_DRAW_RECT =>
+            syscall_draw_rect(
+                frame,
+            ),
+
+        SYS_CREATE_WINDOW =>
+            syscall_create_window(
+                frame,
+            ),
+
+        SYS_UPDATE_WINDOW =>
+            syscall_update_window(
+                frame,
+            ),
+
+        SYS_FLUSH_SCREEN =>
+            syscall_flush_screen(),
+
         _ => ENOSYS,
     }
 }
@@ -641,6 +680,225 @@ fn syscall_sleep(
     _frame: &SyscallFrame,
 ) -> u64 {
     SUCCESS
+}
+
+// ============================================================
+// SYS_FILL_RECT (#7)
+// rdi = window_id, rsi = x, rdx = y, r10 = width, r8 = height, r9 = color
+// ============================================================
+
+fn syscall_fill_rect(
+    frame: &SyscallFrame,
+) -> u64 {
+    let window_id = frame.rdi;
+    let x = frame.rsi as usize;
+    let y = frame.rdx as usize;
+    let width = frame.r10 as usize;
+    let height = frame.r8 as usize;
+    let color_argb = frame.r9 as u32;
+
+    let mut wm_lock = crate::wm::WM.lock();
+
+    if let Some(ref mut wm) = *wm_lock {
+        if let Some(win) = wm.windows.get_mut(&window_id) {
+            win.fill_rect(x, y, width, height, color_argb);
+            return 1;
+        }
+    }
+    0
+}
+
+// ============================================================
+// SYS_DRAW_STRING (#8)
+// rdi = window_id, rsi = x, rdx = y, r10 = str_ptr, r8 = str_len, r9 = scale
+// ============================================================
+
+fn syscall_draw_string(
+    frame: &SyscallFrame,
+) -> u64 {
+    let window_id = frame.rdi;
+    let x = frame.rsi as usize;
+    let y = frame.rdx as usize;
+    let str_ptr = frame.r10;
+    let str_len = frame.r8 as usize;
+    let scale = frame.r9 as usize;
+
+    if !unsafe {
+        crate::memory::validate_user_range(
+            crate::memory::current_level_4_frame(),
+            str_ptr,
+            str_len,
+            false,
+        )
+    } {
+        return 0;
+    }
+
+    let bytes = unsafe { core::slice::from_raw_parts(str_ptr as *const u8, str_len) };
+    let text = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let mut wm_lock = crate::wm::WM.lock();
+
+    if let Some(ref mut wm) = *wm_lock {
+        if let Some(win) = wm.windows.get_mut(&window_id) {
+            win.draw_string(x, y, text, Color::WHITE, scale);
+            return 1;
+        }
+    }
+    0
+}
+
+// ============================================================
+// SYS_DRAW_RECT (#9)
+// rdi = window_id, rsi = x, rdx = y, r10 = width, r8 = height, r9 = color
+// ============================================================
+
+fn syscall_draw_rect(
+    frame: &SyscallFrame,
+) -> u64 {
+    let window_id = frame.rdi;
+    let x = frame.rsi as usize;
+    let y = frame.rdx as usize;
+    let width = frame.r10 as usize;
+    let height = frame.r8 as usize;
+    let color_argb = frame.r9 as u32;
+
+    if width == 0 || height == 0 {
+        return 0;
+    }
+
+    let mut wm_lock = crate::wm::WM.lock();
+
+    if let Some(ref mut wm) = *wm_lock {
+        if let Some(win) = wm.windows.get_mut(&window_id) {
+            // Draw rectangle outline (top, bottom, left, right)
+            win.fill_rect(x, y, width, 1, color_argb);
+            win.fill_rect(x, y + height - 1, width, 1, color_argb);
+            win.fill_rect(x, y, 1, height, color_argb);
+            win.fill_rect(x + width - 1, y, 1, height, color_argb);
+            return 1;
+        }
+    }
+    0
+}
+
+// ============================================================
+// SYS_CREATE_WINDOW
+// ============================================================
+
+fn syscall_create_window(
+    frame: &SyscallFrame,
+) -> u64 {
+    let x =
+        frame.rdi as i32;
+
+    let y =
+        frame.rsi as i32;
+
+    let width =
+        frame.rdx as usize;
+
+    let height =
+        frame.r10 as usize;
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    if let Some(ref mut compositor) = *wm_lock {
+        compositor.create_window(
+            x,
+            y,
+            width,
+            height,
+        )
+    } else {
+        0
+    }
+}
+
+// ============================================================
+// SYS_UPDATE_WINDOW
+// ============================================================
+
+fn syscall_update_window(
+    frame: &SyscallFrame,
+) -> u64 {
+    let window_id =
+        frame.rdi;
+
+    let buffer_address =
+        frame.rsi;
+
+    let pixel_count =
+        frame.rdx as usize;
+
+    // Validate that the user buffer is mapped and accessible.
+    // u32 = 4 bytes per pixel. Checked multiplication prevents integer overflow.
+    let byte_length = match pixel_count.checked_mul(4) {
+        Some(length) => length,
+        None => {
+            crate::serial::write_str(
+                "sys_update_window: pixel count overflow\n",
+            );
+            return 0;
+        }
+    };
+
+    if !unsafe {
+        crate::memory::validate_user_range(
+            crate::memory::current_level_4_frame(),
+            buffer_address,
+            byte_length,
+            false,
+        )
+    } {
+        crate::serial::write_str(
+            "sys_update_window: invalid user memory range\n",
+        );
+        return 0;
+    }
+
+    let user_pixels =
+        unsafe {
+            core::slice::from_raw_parts(
+                buffer_address as *const u32,
+                pixel_count,
+            )
+        };
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    if let Some(ref mut compositor) = *wm_lock {
+        compositor.update_window_pixels(
+            window_id,
+            user_pixels,
+        );
+
+        1
+    } else {
+        0
+    }
+}
+
+// ============================================================
+// SYS_FLUSH_SCREEN
+// ============================================================
+
+fn syscall_flush_screen() -> u64 {
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    if let Some(ref mut compositor) = *wm_lock {
+        compositor.draw();
+
+        1
+    } else {
+        0
+    }
 }
 
 // ============================================================

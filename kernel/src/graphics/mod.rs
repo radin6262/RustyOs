@@ -25,26 +25,47 @@ pub use buffer::{
     present,
 };
 
+// pub fn init(
+//     framebuffer: &mut FrameBuffer,
+// ) {
+//     crate::font::init();
+//
+//     buffer::init(
+//         framebuffer,
+//     );
+//
+//     //
+//     // Build the static Rusty background + panel.
+//     //
+//     ui::build_base();
+//
+//     //
+//     // Show the completed initial frame.
+//     //
+//     buffer::present(
+//         framebuffer,
+//     );
+// }
 pub fn init(
     framebuffer: &mut FrameBuffer,
 ) {
+    crate::serial::write_str("graphics: before font init\n");
+
     crate::font::init();
 
-    buffer::init(
-        framebuffer,
-    );
+    crate::serial::write_str("graphics: font init OK\n");
 
-    //
-    // Build the static Rusty background + panel.
-    //
+    buffer::init(framebuffer);
+
+    crate::serial::write_str("graphics: buffer init OK\n");
+
     ui::build_base();
 
-    //
-    // Show the completed initial frame.
-    //
-    buffer::present(
-        framebuffer,
-    );
+    crate::serial::write_str("graphics: UI build OK\n");
+
+    buffer::present(framebuffer);
+
+    crate::serial::write_str("graphics: present OK\n");
 }
 
 pub fn width() -> usize {
