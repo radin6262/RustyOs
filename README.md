@@ -4,6 +4,9 @@ RustyOS is a lightweight hobby operating system written in Rust.
 
 a simple modern uefi hobby operating system
 
+## Version Logs
+Version logs will contain changlogs and deprecation notices. [Click Me](versionlogs.md) to go version logs
+
 ## Features
 
 - UEFI boot
@@ -14,7 +17,7 @@ a simple modern uefi hobby operating system
 - Framebuffer graphics
 - Window manager and compositor
 - Double-buffered rendering
-- USB keyboard support through xHCI
+- USB keyboard support through xHCI(xhci-nostd)
 - Ring 3 userspace
 - Separate process address spaces
 - CR3 context switching
