@@ -292,6 +292,18 @@ pub fn load_elf(
             "ELF: PT_LOAD vaddr=",
         );
 
+        crate::serial::write_str(
+            " flags=",
+        );
+
+        crate::serial::write_hex(
+            ph.p_flags as u64,
+        );
+
+        crate::serial::write_str(
+            "\n",
+        );
+
         crate::serial::write_hex(
             ph.p_vaddr,
         );

@@ -7,13 +7,18 @@ use core::sync::atomic::{
 };
 
 use x86_64::{
+    instructions::interrupts,
     registers::control::{
         Cr3,
         Cr3Flags,
     },
-    structures::paging::{
-        PhysFrame,
-        Size4KiB,
+    registers::rflags::RFlags,
+    structures::{
+        idt::InterruptStackFrameValue,
+        paging::{
+            PhysFrame,
+            Size4KiB,
+        },
     },
     VirtAddr,
 };
@@ -231,9 +236,9 @@ impl Process {
                     .0 as u64,
 
                 // Required RFLAGS bit.
-                // Interrupts remain disabled
-                // until the interrupt/timer path is
-                // ready.
+                //
+                // IF remains clear until the userspace
+                // interrupt/timer path is ready.
                 rflags:
                 1 << 1,
 
@@ -671,6 +676,45 @@ pub fn current_pid()
 }
 
 // ============================================================
+// Save current context
+// ============================================================
+
+pub fn save_current_context(
+    context: SavedUserContext,
+) -> bool {
+    let mut guard =
+        PROCESS_MANAGER.lock();
+
+    let manager =
+        &mut *guard;
+
+    let current_pid =
+        match manager.current {
+            Some(pid) => pid,
+            None => return false,
+        };
+
+    let current =
+        match manager.find_process_mut(
+            current_pid,
+        ) {
+            Some(process) => process,
+            None => return false,
+        };
+
+    if current.state
+        == ProcessState::Exited
+    {
+        return false;
+    }
+
+    current.context =
+        context;
+
+    true
+}
+
+// ============================================================
 // Current process page table
 // ============================================================
 
@@ -757,6 +801,20 @@ pub fn set_current(
 // ============================================================
 // Enter current process
 // ============================================================
+//
+// IMPORTANT:
+//
+// The complete IRET frame is constructed BEFORE switching CR3.
+//
+// Interrupts are disabled before the CR3 switch so a hardware
+// interrupt cannot arrive in the tiny window between:
+//
+//     CR3 switch
+//         and
+//     IRETQ
+//
+// After CR3 is changed, we perform IRETQ immediately.
+//
 
 pub unsafe fn enter_current(
     selectors: Selectors,
@@ -777,7 +835,8 @@ pub unsafe fn enter_current(
             );
 
         let process =
-            manager.find_process(pid)
+            manager
+                .find_process(pid)
                 .expect(
                     "Rusty: current process missing",
                 );
@@ -786,7 +845,7 @@ pub unsafe fn enter_current(
             != ProcessState::Running
         {
             panic!(
-                "Rusty: current process is not Running"
+                "Rusty: current process is not Running",
             );
         }
 
@@ -796,6 +855,68 @@ pub unsafe fn enter_current(
         context =
             process.context;
     }
+
+    // --------------------------------------------------------
+    // Disable interrupts BEFORE changing CR3.
+    // --------------------------------------------------------
+
+    interrupts::disable();
+
+    crate::serial::write_str(
+        "PROCESS ENTER: preparing Ring 3 frame\n",
+    );
+
+    crate::serial::write_str(
+        "  CR3=",
+    );
+
+    crate::serial::write_hex(
+        level_4_frame
+            .start_address()
+            .as_u64(),
+    );
+
+    crate::serial::write_str(
+        " RIP=",
+    );
+
+    crate::serial::write_hex(
+        context.rip,
+    );
+
+    crate::serial::write_str(
+        " RSP=",
+    );
+
+    crate::serial::write_hex(
+        context.rsp,
+    );
+
+    crate::serial::write_str(
+        "\n",
+    );
+
+    // --------------------------------------------------------
+    // Construct the IRET frame BEFORE changing CR3.
+    //
+    // This is intentionally done while the old kernel address
+    // space is active.
+    // --------------------------------------------------------
+
+    let frame =
+        InterruptStackFrameValue::new(
+            VirtAddr::new(
+                context.rip,
+            ),
+            selectors.user_code,
+            RFlags::from_bits_retain(
+                context.rflags,
+            ),
+            VirtAddr::new(
+                context.rsp,
+            ),
+            selectors.user_data,
+        );
 
     // --------------------------------------------------------
     // Switch to the process page table.
@@ -809,23 +930,14 @@ pub unsafe fn enter_current(
     }
 
     // --------------------------------------------------------
-    // Enter Ring 3.
+    // CR3 has changed.
+    //
+    // Do not call Rust code here.
+    // Do not lock anything.
+    // Do not allocate anything.
+    //
+    // Immediately transition to Ring 3.
     // --------------------------------------------------------
-
-    let frame =
-        x86_64::structures::idt::InterruptStackFrameValue::new(
-            VirtAddr::new(
-                context.rip,
-            ),
-            selectors.user_code,
-            x86_64::registers::rflags::RFlags::from_bits_retain(
-                context.rflags,
-            ),
-            VirtAddr::new(
-                context.rsp,
-            ),
-            selectors.user_data,
-        );
 
     unsafe {
         frame.iretq();
@@ -938,18 +1050,6 @@ pub fn yield_current(
             Cr3Flags::empty(),
         );
     }
-
-    // crate::serial::write_str(
-    //     "scheduler: switched to PID=",
-    // );
-
-    // crate::serial::write_usize(
-    //     next_pid as usize,
-    // );
-
-    // crate::serial::write_str(
-    //     "\n",
-    // );
 
     ScheduleResult::Switched(
         next_context,

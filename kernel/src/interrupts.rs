@@ -294,6 +294,26 @@ fn general_exception_handler(
             .0 as u64,
     );
 
+    // --------------------------------------------------------
+    // Page-fault specific information
+    // --------------------------------------------------------
+
+    if index == 14 {
+        serial::write_str(
+            "\nCR2: ",
+        );
+
+        serial::write_hex(
+            x86_64::registers::control::Cr2::read()
+                .unwrap()
+                .as_u64(),
+        );
+    }
+
+    // --------------------------------------------------------
+    // Error code
+    // --------------------------------------------------------
+
     serial::write_str(
         "\nERROR: ",
     );
@@ -303,6 +323,125 @@ fn general_exception_handler(
             serial::write_hex(
                 value,
             );
+
+            // ------------------------------------------------
+            // Decode page-fault error code
+            //
+            // Bit 0:
+            //     0 = non-present page
+            //     1 = protection violation
+            //
+            // Bit 1:
+            //     0 = read
+            //     1 = write
+            //
+            // Bit 2:
+            //     0 = supervisor
+            //     1 = user
+            //
+            // Bit 3:
+            //     1 = reserved-bit violation
+            //
+            // Bit 4:
+            //     1 = instruction fetch
+            //
+            // Bit 5:
+            //     1 = protection-key violation
+            //
+            // Bit 6:
+            //     1 = shadow-stack access
+            //
+            // Bit 7:
+            //     1 = RMP violation
+            //
+            // ------------------------------------------------
+
+            if index == 14 {
+                serial::write_str(
+                    "\nPAGE FAULT:",
+                );
+
+                if value & 1 != 0 {
+                    serial::write_str(
+                        " protection-violation",
+                    );
+                } else {
+                    serial::write_str(
+                        " non-present",
+                    );
+                }
+
+                if value & 2 != 0 {
+                    serial::write_str(
+                        " write",
+                    );
+                } else {
+                    serial::write_str(
+                        " read",
+                    );
+                }
+
+                if value & 4 != 0 {
+                    serial::write_str(
+                        " user",
+                    );
+                } else {
+                    serial::write_str(
+                        " supervisor",
+                    );
+                }
+
+                if value & 8 != 0 {
+                    serial::write_str(
+                        " reserved-bit",
+                    );
+                }
+
+                if value & 16 != 0 {
+                    serial::write_str(
+                        " instruction-fetch",
+                    );
+                }
+
+                if value & 32 != 0 {
+                    serial::write_str(
+                        " protection-key",
+                    );
+                }
+
+                if value & 64 != 0 {
+                    serial::write_str(
+                        " shadow-stack",
+                    );
+                }
+
+                if value & 128 != 0 {
+                    serial::write_str(
+                        " rmp",
+                    );
+                }
+
+                // --------------------------------------------
+                // Convenient interpretation for the common
+                // NX case:
+                //
+                //     protection violation
+                //     user
+                //     instruction fetch
+                //
+                // This usually means the target page is marked
+                // NX / NO_EXECUTE.
+                // --------------------------------------------
+
+                if value & 1 != 0
+                    && value & 4 != 0
+                    && value & 16 != 0
+                {
+                    serial::write_str(
+                        "\nLIKELY CAUSE: instruction fetch was rejected (possible NX/NO_EXECUTE page)",
+                    );
+                }
+            }
         }
 
         None => {

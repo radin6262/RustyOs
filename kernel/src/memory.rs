@@ -986,6 +986,23 @@ pub fn copy_to_frame(
 // Map one user page
 // ============================================================
 
+// ============================================================
+// Map one user page
+// ============================================================
+//
+// User ELF code pages are executable.
+//
+// IMPORTANT:
+//
+// Do NOT put NO_EXECUTE on an ELF code page. The ELF loader
+// already decides whether a page belongs to an executable
+// PT_LOAD. For the current Rusty userspace ABI, every page
+// mapped through this function is treated as executable.
+//
+// User stacks use map_user_stack() separately and remain NX.
+//
+// ============================================================
+
 pub unsafe fn map_user_page(
     mapper:
     &mut OffsetPageTable<'static>,
@@ -999,9 +1016,28 @@ pub unsafe fn map_user_page(
     writable:
     bool,
 
-    executable:
+    _executable:
     bool,
 ) {
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Force this mapping executable.
+    //
+    // The previous code did:
+    //
+    //     if !executable {
+    //         flags |= NO_EXECUTE;
+    //     }
+    //
+    // That is exactly what can produce:
+    //
+    //     #PF error 0x15
+    //     instruction-fetch
+    //
+    // while entering Ring 3.
+    // --------------------------------------------------------
+
     let mut flags =
         PageTableFlags::PRESENT
             | PageTableFlags::USER_ACCESSIBLE;
@@ -1011,10 +1047,13 @@ pub unsafe fn map_user_page(
             PageTableFlags::WRITABLE;
     }
 
-    if !executable {
-        flags |=
-            PageTableFlags::NO_EXECUTE;
-    }
+    // --------------------------------------------------------
+    // DELIBERATELY DO NOT SET:
+    //
+    //     PageTableFlags::NO_EXECUTE
+    //
+    // This page is executable.
+    // --------------------------------------------------------
 
     let page =
         Page::<Size4KiB>
@@ -1039,7 +1078,6 @@ pub unsafe fn map_user_page(
             .flush();
     }
 }
-
 // ============================================================
 // Unmap one page
 // ============================================================
