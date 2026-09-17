@@ -336,6 +336,12 @@ impl UserAddressSpace {
         self.level_4_frame
     }
 
+    pub fn mapper_mut(
+        &mut self,
+    ) -> &mut OffsetPageTable<'static> {
+        &mut self.mapper
+    }
+
     pub fn user_code_address(
         &self,
     ) -> VirtAddr {

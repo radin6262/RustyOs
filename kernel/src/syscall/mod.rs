@@ -3,7 +3,6 @@ use core::arch::global_asm;
 use x86_64::{
     structures::{
         idt::InterruptDescriptorTable,
-        paging::PageTableFlags,
     },
     PrivilegeLevel,
     VirtAddr,
@@ -36,6 +35,10 @@ pub const SYS_DRAW_RECT: u64 = 9;
 pub const SYS_CREATE_WINDOW: u64 = 100;
 pub const SYS_UPDATE_WINDOW: u64 = 101;
 pub const SYS_FLUSH_SCREEN: u64 = 102;
+pub const SYS_CLICK: u64 = 103;
+pub const SYS_DESTROY_WINDOW: u64 = 104;
+pub const SYS_LAUNCH_APP: u64 = 105;
+pub const SYS_CLICK_RECT: u64 = 106;
 
 const ENOSYS: u64 = u64::MAX;
 const SUCCESS: u64 = 0;
@@ -308,6 +311,15 @@ extern "C" fn rusty_syscall_dispatch(
     frame: *mut SyscallFrame,
     interrupt: *mut UserInterruptFrame,
 ) -> u64 {
+    // --------------------------------------------------------
+    // Service physical mouse input on every kernel entry.
+    //
+    // This updates the compositor cursor using the small
+    // cursor-only path. It does NOT redraw the entire desktop.
+    // --------------------------------------------------------
+
+    service_mouse();
+
     let frame =
         unsafe {
             &mut *frame
@@ -383,6 +395,26 @@ extern "C" fn rusty_syscall_dispatch(
         SYS_FLUSH_SCREEN =>
             syscall_flush_screen(),
 
+        SYS_CLICK =>
+            syscall_click(
+                frame,
+            ),
+
+        SYS_DESTROY_WINDOW =>
+            syscall_destroy_window(
+                frame,
+            ),
+
+        SYS_LAUNCH_APP =>
+            syscall_launch_app(
+                frame,
+            ),
+
+        SYS_CLICK_RECT =>
+            syscall_click_rect(
+                frame,
+            ),
+
         _ => ENOSYS,
     }
 }
@@ -426,6 +458,20 @@ fn syscall_yield(
     frame: &mut SyscallFrame,
     interrupt: &mut UserInterruptFrame,
 ) -> u64 {
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // DO NOT call wm.draw() here.
+    //
+    // SYS_YIELD is used constantly by userspace programs.
+    // Redrawing here would recomposite the entire desktop and
+    // copy the entire framebuffer on every scheduler yield.
+    //
+    // Mouse movement is already handled by service_mouse()
+    // at the beginning of rusty_syscall_dispatch(), which uses
+    // update_cursor_only().
+    // --------------------------------------------------------
+
     let current_context =
         save_context(
             frame,
@@ -534,6 +580,7 @@ fn syscall_write(
         crate::serial::write_str(
             "sys_write: unsupported file descriptor\n",
         );
+
         return u64::MAX;
     }
 
@@ -548,6 +595,7 @@ fn syscall_write(
         crate::serial::write_str(
             "sys_write: invalid user memory range or unmapped page\n",
         );
+
         return u64::MAX;
     }
 
@@ -597,6 +645,7 @@ fn syscall_read(
         crate::serial::write_str(
             "sys_read: unsupported file descriptor\n",
         );
+
         return u64::MAX;
     }
 
@@ -611,35 +660,60 @@ fn syscall_read(
         crate::serial::write_str(
             "sys_read: invalid user memory range, unmapped page, or read-only destination\n",
         );
+
         return u64::MAX;
     }
 
     // Attempt to poll keyboard input non-blocking
-    if let Some(key) = crate::input::read_key() {
-        let ascii_byte = match key {
-            crate::input::Key::Character(c) => c as u8,
-            crate::input::Key::Enter => b'\n',
-            crate::input::Key::Space => b' ',
-            crate::input::Key::Backspace => 0x08,
-            _ => 0,
-        };
+    if let Some(key) =
+        crate::input::read_key()
+    {
+        let ascii_byte =
+            match key {
+                crate::input::Key::Character(
+                    c,
+                ) =>
+                    c as u8,
+
+                crate::input::Key::Enter =>
+                    b'\n',
+
+                crate::input::Key::Space =>
+                    b' ',
+
+                crate::input::Key::Backspace =>
+                    0x08,
+
+                _ =>
+                    0,
+            };
 
         if ascii_byte != 0 {
             unsafe {
-                *(address as *mut u8) = ascii_byte;
+                *(address as *mut u8) =
+                    ascii_byte;
             }
+
             return 1;
         } else {
             return 0;
         }
     } else {
-        // Save original RIP prior to rewinding for yield execution
-        let original_rip = interrupt.rip;
+        // Save original RIP prior to rewinding
+        // for yield execution.
+        let original_rip =
+            interrupt.rip;
 
-        // No keystroke available: block process by rewinding RIP past `int 0x80` (2 bytes)
-        // and yielding CPU execution to other tasks.
+        // No keystroke available:
+        //
+        // Rewind RIP past `int 0x80` so the syscall will
+        // execute again when this process resumes.
         interrupt.rip =
-            interrupt.rip.checked_sub(2).unwrap_or(interrupt.rip);
+            interrupt.rip
+                .checked_sub(2)
+                .unwrap_or(
+                    interrupt.rip,
+                );
 
         let current_context =
             save_context(
@@ -663,9 +737,11 @@ fn syscall_read(
             }
 
             ScheduleResult::NoProcess => {
-                // If no context switch took place, restore original RIP so the process
-                // doesn't re-execute int 0x80 with RAX = 0 (SYS_EXIT).
-                interrupt.rip = original_rip;
+                // If no context switch took place,
+                // restore original RIP.
+                interrupt.rip =
+                    original_rip;
+
                 0
             }
         }
@@ -684,44 +760,91 @@ fn syscall_sleep(
 
 // ============================================================
 // SYS_FILL_RECT (#7)
-// rdi = window_id, rsi = x, rdx = y, r10 = width, r8 = height, r9 = color
+// rdi = window_id
+// rsi = x
+// rdx = y
+// r10 = width
+// r8  = height
+// r9  = color
 // ============================================================
 
 fn syscall_fill_rect(
     frame: &SyscallFrame,
 ) -> u64 {
-    let window_id = frame.rdi;
-    let x = frame.rsi as usize;
-    let y = frame.rdx as usize;
-    let width = frame.r10 as usize;
-    let height = frame.r8 as usize;
-    let color_argb = frame.r9 as u32;
+    let window_id =
+        frame.rdi;
 
-    let mut wm_lock = crate::wm::WM.lock();
+    let x =
+        frame.rsi as usize;
 
-    if let Some(ref mut wm) = *wm_lock {
-        if let Some(win) = wm.windows.get_mut(&window_id) {
-            win.fill_rect(x, y, width, height, color_argb);
+    let y =
+        frame.rdx as usize;
+
+    let width =
+        frame.r10 as usize;
+
+    let height =
+        frame.r8 as usize;
+
+    let color_argb =
+        frame.r9 as u32;
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    if let Some(ref mut wm) =
+        *wm_lock
+    {
+        if let Some(win) =
+            wm.windows.get_mut(
+                &window_id,
+            )
+        {
+            win.fill_rect(
+                x,
+                y,
+                width,
+                height,
+                color_argb,
+            );
+
             return 1;
         }
     }
+
     0
 }
 
 // ============================================================
 // SYS_DRAW_STRING (#8)
-// rdi = window_id, rsi = x, rdx = y, r10 = str_ptr, r8 = str_len, r9 = scale
+// rdi = window_id
+// rsi = x
+// rdx = y
+// r10 = str_ptr
+// r8  = str_len
+// r9  = scale
 // ============================================================
 
 fn syscall_draw_string(
     frame: &SyscallFrame,
 ) -> u64 {
-    let window_id = frame.rdi;
-    let x = frame.rsi as usize;
-    let y = frame.rdx as usize;
-    let str_ptr = frame.r10;
-    let str_len = frame.r8 as usize;
-    let scale = frame.r9 as usize;
+    let window_id =
+        frame.rdi;
+
+    let x =
+        frame.rsi as usize;
+
+    let y =
+        frame.rdx as usize;
+
+    let str_ptr =
+        frame.r10;
+
+    let str_len =
+        frame.r8 as usize;
+
+    let scale =
+        frame.r9 as usize;
 
     if !unsafe {
         crate::memory::validate_user_range(
@@ -734,54 +857,137 @@ fn syscall_draw_string(
         return 0;
     }
 
-    let bytes = unsafe { core::slice::from_raw_parts(str_ptr as *const u8, str_len) };
-    let text = match core::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+    let bytes =
+        unsafe {
+            core::slice::from_raw_parts(
+                str_ptr as *const u8,
+                str_len,
+            )
+        };
 
-    let mut wm_lock = crate::wm::WM.lock();
+    let text =
+        match core::str::from_utf8(
+            bytes,
+        ) {
+            Ok(text) =>
+                text,
 
-    if let Some(ref mut wm) = *wm_lock {
-        if let Some(win) = wm.windows.get_mut(&window_id) {
-            win.draw_string(x, y, text, Color::WHITE, scale);
+            Err(_) =>
+                return 0,
+        };
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    if let Some(ref mut wm) =
+        *wm_lock
+    {
+        if let Some(win) =
+            wm.windows.get_mut(
+                &window_id,
+            )
+        {
+            win.draw_string(
+                x,
+                y,
+                text,
+                Color::WHITE,
+                scale,
+            );
+
             return 1;
         }
     }
+
     0
 }
 
 // ============================================================
 // SYS_DRAW_RECT (#9)
-// rdi = window_id, rsi = x, rdx = y, r10 = width, r8 = height, r9 = color
+// rdi = window_id
+// rsi = x
+// rdx = y
+// r10 = width
+// r8  = height
+// r9  = color
 // ============================================================
 
 fn syscall_draw_rect(
     frame: &SyscallFrame,
 ) -> u64 {
-    let window_id = frame.rdi;
-    let x = frame.rsi as usize;
-    let y = frame.rdx as usize;
-    let width = frame.r10 as usize;
-    let height = frame.r8 as usize;
-    let color_argb = frame.r9 as u32;
+    let window_id =
+        frame.rdi;
 
-    if width == 0 || height == 0 {
+    let x =
+        frame.rsi as usize;
+
+    let y =
+        frame.rdx as usize;
+
+    let width =
+        frame.r10 as usize;
+
+    let height =
+        frame.r8 as usize;
+
+    let color_argb =
+        frame.r9 as u32;
+
+    if width == 0
+        || height == 0
+    {
         return 0;
     }
 
-    let mut wm_lock = crate::wm::WM.lock();
+    let mut wm_lock =
+        crate::wm::WM.lock();
 
-    if let Some(ref mut wm) = *wm_lock {
-        if let Some(win) = wm.windows.get_mut(&window_id) {
-            // Draw rectangle outline (top, bottom, left, right)
-            win.fill_rect(x, y, width, 1, color_argb);
-            win.fill_rect(x, y + height - 1, width, 1, color_argb);
-            win.fill_rect(x, y, 1, height, color_argb);
-            win.fill_rect(x + width - 1, y, 1, height, color_argb);
+    if let Some(ref mut wm) =
+        *wm_lock
+    {
+        if let Some(win) =
+            wm.windows.get_mut(
+                &window_id,
+            )
+        {
+            // Draw rectangle outline:
+            // top, bottom, left, right.
+            win.fill_rect(
+                x,
+                y,
+                width,
+                1,
+                color_argb,
+            );
+
+            win.fill_rect(
+                x,
+                y + height - 1,
+                width,
+                1,
+                color_argb,
+            );
+
+            win.fill_rect(
+                x,
+                y,
+                1,
+                height,
+                color_argb,
+            );
+
+            win.fill_rect(
+                x + width - 1,
+                y,
+                1,
+                height,
+                color_argb,
+            );
+
             return 1;
         }
     }
+
     0
 }
 
@@ -807,7 +1013,9 @@ fn syscall_create_window(
     let mut wm_lock =
         crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) = *wm_lock {
+    if let Some(ref mut compositor) =
+        *wm_lock
+    {
         compositor.create_window(
             x,
             y,
@@ -836,16 +1044,22 @@ fn syscall_update_window(
         frame.rdx as usize;
 
     // Validate that the user buffer is mapped and accessible.
-    // u32 = 4 bytes per pixel. Checked multiplication prevents integer overflow.
-    let byte_length = match pixel_count.checked_mul(4) {
-        Some(length) => length,
-        None => {
-            crate::serial::write_str(
-                "sys_update_window: pixel count overflow\n",
-            );
-            return 0;
-        }
-    };
+    //
+    // u32 = 4 bytes per pixel.
+    // Checked multiplication prevents integer overflow.
+    let byte_length =
+        match pixel_count.checked_mul(4) {
+            Some(length) =>
+                length,
+
+            None => {
+                crate::serial::write_str(
+                    "sys_update_window: pixel count overflow\n",
+                );
+
+                return 0;
+            }
+        };
 
     if !unsafe {
         crate::memory::validate_user_range(
@@ -858,6 +1072,7 @@ fn syscall_update_window(
         crate::serial::write_str(
             "sys_update_window: invalid user memory range\n",
         );
+
         return 0;
     }
 
@@ -872,13 +1087,17 @@ fn syscall_update_window(
     let mut wm_lock =
         crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) = *wm_lock {
-        compositor.update_window_pixels(
+    if let Some(ref mut compositor) =
+        *wm_lock
+    {
+        if compositor.update_window_pixels(
             window_id,
             user_pixels,
-        );
-
-        1
+        ) {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }
@@ -892,12 +1111,338 @@ fn syscall_flush_screen() -> u64 {
     let mut wm_lock =
         crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) = *wm_lock {
+    if let Some(ref mut compositor) =
+        *wm_lock
+    {
         compositor.draw();
 
         1
     } else {
         0
+    }
+}
+
+// ============================================================
+// SYS_CLICK (#103)
+// rdi = screen x
+// rsi = screen y
+// ============================================================
+
+fn syscall_click(
+    frame: &SyscallFrame,
+) -> u64 {
+    let x =
+        frame.rdi as usize;
+
+    let y =
+        frame.rsi as usize;
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    if let Some(ref mut compositor) =
+        *wm_lock
+    {
+        if compositor.sys_click(
+            x,
+            y,
+        ) {
+            1
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+// ============================================================
+// SYS_CLICK_RECT (#106)
+// rdi = screen x
+// rsi = screen y
+// rdx = width
+// r10 = height
+// ============================================================
+//
+// Performs hit-testing against a rectangular screen area.
+//
+// The click is considered inside when:
+//
+//     x <= click_x < x + width
+//     y <= click_y < y + height
+//
+// This avoids requiring userspace to predict the exact pixel
+// where the physical mouse button was pressed.
+//
+
+fn syscall_click_rect(
+    frame: &SyscallFrame,
+) -> u64 {
+    let x =
+        frame.rdi as usize;
+
+    let y =
+        frame.rsi as usize;
+
+    let width =
+        frame.rdx as usize;
+
+    let height =
+        frame.r10 as usize;
+
+    crate::serial::write_str(
+        "CLICK DEBUG: SYS_CLICK_RECT query (",
+    );
+
+    crate::serial::write_usize(
+        x,
+    );
+
+    crate::serial::write_str(
+        ", ",
+    );
+
+    crate::serial::write_usize(
+        y,
+    );
+
+    crate::serial::write_str(
+        ", ",
+    );
+
+    crate::serial::write_usize(
+        width,
+    );
+
+    crate::serial::write_str(
+        ", ",
+    );
+
+    crate::serial::write_usize(
+        height,
+    );
+
+    crate::serial::write_str(
+        ")\n",
+    );
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    let Some(ref mut compositor) =
+        *wm_lock
+    else {
+        crate::serial::write_str(
+            "CLICK DEBUG: SYS_CLICK_RECT -> NO COMPOSITOR\n",
+        );
+
+        return 0;
+    };
+
+    if compositor.sys_click_rect(
+        x,
+        y,
+        width,
+        height,
+    ) {
+        1
+    } else {
+        0
+    }
+}
+
+// ============================================================
+// SYS_DESTROY_WINDOW (#104)
+// rdi = window_id
+// ============================================================
+
+fn syscall_destroy_window(
+    frame: &SyscallFrame,
+) -> u64 {
+    let window_id =
+        frame.rdi;
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    let Some(ref mut wm) =
+        *wm_lock
+    else {
+        return 0;
+    };
+
+    if wm.destroy_window(
+        window_id,
+    ) {
+        // The window changed, so a full redraw is appropriate
+        // here. This is NOT part of SYS_YIELD.
+        wm.draw();
+
+        1
+    } else {
+        0
+    }
+}
+
+// ============================================================
+// SYS_LAUNCH_APP (#105)
+// rdi = userspace ELF pointer
+// rsi = ELF length
+// ============================================================
+//
+// The userspace process supplies the ELF bytes.
+//
+// Example userspace ABI:
+//
+//     rax = SYS_LAUNCH_APP
+//     rdi = elf.as_ptr()
+//     rsi = elf.len()
+//
+// On success this function does not return.
+// launch_app::run() creates the new process and enters Ring 3.
+//
+// IMPORTANT:
+// This syscall does NOT destroy any specific window.
+// Window destruction is handled independently by
+// SYS_DESTROY_WINDOW.
+//
+
+fn syscall_launch_app(
+    frame: &SyscallFrame,
+) -> ! {
+    let elf_address =
+        frame.rdi;
+
+    let elf_length =
+        match usize::try_from(
+            frame.rsi,
+        ) {
+            Ok(length) =>
+                length,
+
+            Err(_) => {
+                crate::serial::write_str(
+                    "SYS_LAUNCH_APP: ELF length overflow\n",
+                );
+
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+        };
+
+    // --------------------------------------------------------
+    // Validate ELF buffer.
+    // --------------------------------------------------------
+
+    if elf_address == 0
+        || elf_length == 0
+    {
+        crate::serial::write_str(
+            "SYS_LAUNCH_APP: invalid ELF buffer\n",
+        );
+
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    if !unsafe {
+        crate::memory::validate_user_range(
+            crate::memory::current_level_4_frame(),
+            elf_address,
+            elf_length,
+            false,
+        )
+    } {
+        crate::serial::write_str(
+            "SYS_LAUNCH_APP: invalid user ELF range\n",
+        );
+
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // --------------------------------------------------------
+    // Convert the userspace buffer into an ELF byte slice.
+    //
+    // The range was validated above against the current
+    // process address space.
+    // --------------------------------------------------------
+
+    let elf =
+        unsafe {
+            core::slice::from_raw_parts(
+                elf_address as *const u8,
+                elf_length,
+            )
+        };
+
+    crate::serial::write_str(
+        "SYS_LAUNCH_APP: launching ELF\n",
+    );
+
+    // --------------------------------------------------------
+    // Obtain the GDT selectors used by Ring 3 processes.
+    // --------------------------------------------------------
+
+    let selectors =
+        crate::cpu::gdt::init();
+
+    // --------------------------------------------------------
+    // Launch application.
+    //
+    // launch_app::run() is a diverging function:
+    //
+    //     -> !
+    //
+    // It creates the address space, loads the ELF, maps the
+    // user stack, creates the process, selects it, and finally
+    // enters Ring 3.
+    // --------------------------------------------------------
+
+    crate::launch_app::run(
+        selectors,
+        elf,
+    );
+}
+
+// ============================================================
+// Mouse/compositor tick
+// ============================================================
+//
+// IMPORTANT PERFORMANCE PATH:
+//
+// Mouse movement:
+//
+//     USB mouse
+//         ↓
+//     service_mouse()
+//         ↓
+//     update_mouse()
+//         ↓
+//     update_cursor_only()
+//         ↓
+//     restore tiny old cursor region
+//         ↓
+//     draw tiny cursor
+//
+// There is NO full-screen compositor redraw here.
+//
+
+fn service_mouse() {
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    let Some(ref mut wm) =
+        *wm_lock
+    else {
+        return;
+    };
+
+    if wm.update_mouse() {
+        wm.update_cursor_only();
     }
 }
 

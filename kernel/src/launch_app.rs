@@ -5,8 +5,20 @@ use crate::{
     user,
 };
 
+/// Launches an ELF application in a new Ring 3 process.
+///
+/// The ELF bytes are supplied by the caller, which means you can
+/// launch any embedded ELF with:
+///
+/// let selectors = cpu::gdt::init();
+///
+/// launch_app::run(
+///     selectors,
+///     include_bytes!("path/to/app.elf"),
+/// );
 pub fn run(
     selectors: process::Selectors,
+    elf: &[u8],
 ) -> ! {
     // ========================================================
     // Process manager
@@ -15,45 +27,7 @@ pub fn run(
     process::init();
 
     // ========================================================
-    // Process 1
-    // ========================================================
-
-    // let mut user_space_1 =
-    //     user::UserAddressSpace::new();
-    //
-    // let user_code_1: [u8; 28] = [
-    //     // SYS_TEST
-    //     0xB8, 0x03, 0x00, 0x00, 0x00,
-    //     0xBF, 0x11, 0x11, 0x00, 0x00,
-    //     0xCD, 0x80,
-    //
-    //     // SYS_YIELD
-    //     0xB8, 0x01, 0x00, 0x00, 0x00,
-    //     0xCD, 0x80,
-    //
-    //     // SYS_EXIT
-    //     0xB8, 0x00, 0x00, 0x00, 0x00,
-    //     0x31, 0xFF,
-    //     0xCD, 0x80,
-    // ];
-    //
-    // user_space_1.map_user_code(
-    //     user::address_space::USER_CODE_ADDRESS,
-    //     &user_code_1,
-    // );
-    //
-    // user_space_1.map_user_stack(
-    //     user::address_space::USER_STACK_ADDRESS,
-    // );
-    //
-    // let pid_1 =
-    //     process::create_process(
-    //         user_space_1,
-    //         selectors,
-    //     );
-
-    // ========================================================
-    // Process 2 - Real ELF program
+    // Create address space
     // ========================================================
 
     crate::serial::write_str(
@@ -67,13 +41,17 @@ pub fn run(
         "ELF LAUNCH: address space created\n",
     );
 
+    // ========================================================
+    // Load ELF
+    // ========================================================
+
     crate::serial::write_str(
         "ELF LAUNCH: loading ELF\n",
     );
 
     let loaded =
         match crate::elf::load_elf(
-            crate::programs::Terminal_ELF,
+            elf,
             &mut user_space,
         ) {
             Ok(loaded) => loaded,
@@ -84,18 +62,28 @@ pub fn run(
                 );
 
                 match error {
-                    crate::elf::ElfError::ParseError(message) => {
+                    crate::elf::ElfError::ParseError(
+                        message,
+                    ) => {
                         crate::serial::write_str(
                             "ELF error: ParseError: ",
                         );
-                        crate::serial::write_str(message);
+
+                        crate::serial::write_str(
+                            message,
+                        );
                     }
 
-                    crate::elf::ElfError::InvalidFormat(message) => {
+                    crate::elf::ElfError::InvalidFormat(
+                        message,
+                    ) => {
                         crate::serial::write_str(
                             "ELF error: InvalidFormat: ",
                         );
-                        crate::serial::write_str(message);
+
+                        crate::serial::write_str(
+                            message,
+                        );
                     }
 
                     crate::elf::ElfError::AllocationFailed => {
@@ -105,7 +93,9 @@ pub fn run(
                     }
                 }
 
-                crate::serial::write_str("\n");
+                crate::serial::write_str(
+                    "\n",
+                );
 
                 loop {
                     core::hint::spin_loop();
@@ -116,6 +106,10 @@ pub fn run(
     crate::serial::write_str(
         "ELF LAUNCH: ELF loaded\n",
     );
+
+    // ========================================================
+    // Entry point
+    // ========================================================
 
     crate::serial::write_str(
         "ELF LAUNCH: entry=",
@@ -180,7 +174,9 @@ pub fn run(
         "ELF LAUNCH: setting current\n",
     );
 
-    if !process::set_current(pid) {
+    if !process::set_current(
+        pid,
+    ) {
         crate::serial::write_str(
             "ELF LAUNCH: set_current FAILED\n",
         );

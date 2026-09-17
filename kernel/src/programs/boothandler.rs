@@ -1,7 +1,7 @@
 #![no_std]
 
 use bootloader_api::BootInfo;
-use crate::{cpu, graphics, input, interrupts, memory, serial, wasm, wm};
+use crate::{cpu, graphics, input, interrupts, memory, serial, wm};
 use crate::graphics::Color;
 
 pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {

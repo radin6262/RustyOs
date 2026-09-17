@@ -192,6 +192,7 @@ impl Process {
     fn new(
         pid: u64,
         address_space: &UserAddressSpace,
+        entry_point: u64,
         selectors: Selectors,
     ) -> Self {
         Self {
@@ -222,9 +223,7 @@ impl Process {
                 r15: 0,
 
                 rip:
-                address_space
-                    .user_code_address()
-                    .as_u64(),
+                entry_point,
 
                 cs:
                 selectors
@@ -530,6 +529,9 @@ pub fn create_process(
         Process::new(
             pid,
             &address_space,
+            address_space
+                .user_code_address()
+                .as_u64(),
             selectors,
         );
 
@@ -556,6 +558,96 @@ pub fn create_process(
 
     crate::serial::write_usize(
         pid as usize,
+    );
+
+    crate::serial::write_str(
+        "\n",
+    );
+
+    pid
+}
+
+// ============================================================
+// ELF process creation
+// ============================================================
+
+pub fn create_elf_process(
+    address_space: UserAddressSpace,
+    entry_point: u64,
+    selectors: Selectors,
+) -> u64 {
+    if !INITIALIZED.load(
+        Ordering::Acquire,
+    ) {
+        panic!(
+            "Rusty: process manager not initialized"
+        );
+    }
+
+    let mut guard =
+        PROCESS_MANAGER.lock();
+
+    let manager =
+        &mut *guard;
+
+    let slot_index =
+        manager
+            .find_free_slot()
+            .expect(
+                "Rusty: process table is full",
+            );
+
+    let pid =
+        PID_ALLOC.fetch_add(
+            1,
+            Ordering::Relaxed,
+        );
+
+    assert_ne!(
+        pid,
+        0,
+        "Rusty: PID allocator wrapped",
+    );
+
+    let process =
+        Process::new(
+            pid,
+            &address_space,
+            entry_point,
+            selectors,
+        );
+
+    // UserAddressSpace owns the mapper object,
+    // but its actual page tables are allocated
+    // through the kernel memory subsystem and are
+    // intentionally left alive.
+    drop(address_space);
+
+    let slot =
+        &mut manager.processes[
+            slot_index
+            ];
+
+    slot.process.write(
+        process,
+    );
+
+    slot.occupied = true;
+
+    crate::serial::write_str(
+        "process: created ELF PID=",
+    );
+
+    crate::serial::write_usize(
+        pid as usize,
+    );
+
+    crate::serial::write_str(
+        " entry=",
+    );
+
+    crate::serial::write_hex(
+        entry_point,
     );
 
     crate::serial::write_str(
@@ -847,17 +939,17 @@ pub fn yield_current(
         );
     }
 
-    crate::serial::write_str(
-        "scheduler: switched to PID=",
-    );
+    // crate::serial::write_str(
+    //     "scheduler: switched to PID=",
+    // );
 
-    crate::serial::write_usize(
-        next_pid as usize,
-    );
+    // crate::serial::write_usize(
+    //     next_pid as usize,
+    // );
 
-    crate::serial::write_str(
-        "\n",
-    );
+    // crate::serial::write_str(
+    //     "\n",
+    // );
 
     ScheduleResult::Switched(
         next_context,

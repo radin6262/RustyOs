@@ -16,5 +16,6 @@ qemu-system-x86_64 `
     -bios "C:\Program Files\qemu\OVMF.fd" `
     -device qemu-xhci,id=xhci `
     -device usb-kbd,bus=xhci.0 `
+    -device usb-mouse,bus=xhci.0 `
     -drive "format=raw,file=$RustyImage" `
     -serial stdio

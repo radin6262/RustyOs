@@ -2,6 +2,8 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+use core::panic::PanicInfo;
+
 extern crate alloc;
 
 mod cpu;
@@ -14,11 +16,11 @@ mod process;
 mod programs;
 mod serial;
 mod syscall;
-mod terminal;
 mod user;
-mod wasm;
 mod wm;
 mod delay;
+mod elf;
+mod launch_app;
 
 use bootloader_api::{
     config::{BootloaderConfig, Mapping},
@@ -50,14 +52,36 @@ fn kernel_main(
         boot_info,
     );
 
+    if let Some(mouse) = crate::input::poll_mouse() {
+        crate::serial::write_str("MOUSE EVENT\n");
+
+        crate::serial::write_str("dx=");
+        crate::serial::write_hex(
+            mouse.dx as i64 as u64,
+        );
+
+        crate::serial::write_str(" dy=");
+        crate::serial::write_hex(
+            mouse.dy as i64 as u64,
+        );
+
+        crate::serial::write_str(" buttons=");
+        crate::serial::write_usize(
+            mouse.buttons as usize,
+        );
+
+        crate::serial::write_str("\n");
+    }
 
     let selectors =
         cpu::gdt::init();
 
-
-    programs::test_ring3::run(
+    launch_app::run(
         selectors,
+        include_bytes!("../../user/launcher/Launcher"),
     );
+
+
 
     // Kernel idle loop once boot sequence completes
     halt();
@@ -78,7 +102,39 @@ fn halt() -> ! {
 // ============================================================
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    serial::write_str("\nRUSTY PANIC\n");
-    halt();
+fn panic(info: &PanicInfo) -> ! {
+    crate::serial::write_str(
+        "\n\nRUSTY PANIC\n",
+    );
+
+    if let Some(location) = info.location() {
+        crate::serial::write_str(
+            "file: ",
+        );
+        crate::serial::write_str(
+            location.file(),
+        );
+
+        crate::serial::write_str(
+            "\nline: ",
+        );
+        crate::serial::write_usize(
+            location.line() as usize,
+        );
+
+        crate::serial::write_str(
+            "\ncolumn: ",
+        );
+        crate::serial::write_usize(
+            location.column() as usize,
+        );
+
+        crate::serial::write_str(
+            "\n",
+        );
+    }
+
+    loop {
+        core::hint::spin_loop();
+    }
 }

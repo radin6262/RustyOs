@@ -9,14 +9,18 @@ use core::{
 
 use xhci_nostd::XhciController;
 
-use super::Key;
+use super::{
+    mouse::MouseEvent,
+    Key,
+};
 
 // ============================================================
 // Controller storage
 // ============================================================
 
 struct ControllerStorage {
-    controller: UnsafeCell<Option<XhciController>>,
+    controller:
+        UnsafeCell<Option<XhciController>>,
 }
 
 unsafe impl Sync for ControllerStorage {}
@@ -24,28 +28,38 @@ unsafe impl Sync for ControllerStorage {}
 impl ControllerStorage {
     const fn new() -> Self {
         Self {
-            controller: UnsafeCell::new(None),
+            controller:
+            UnsafeCell::new(None),
         }
     }
 }
 
-static CONTROLLER: ControllerStorage =
+static CONTROLLER:
+ControllerStorage =
     ControllerStorage::new();
 
 // ============================================================
 // State
 // ============================================================
 
-static INITIALIZED: AtomicU8 =
+static INITIALIZED:
+AtomicU8 =
     AtomicU8::new(0);
 
-static KEYBOARD_PRESENT: AtomicU8 =
+static KEYBOARD_PRESENT:
+AtomicU8 =
     AtomicU8::new(0);
 
-static LAST_USAGE: AtomicU8 =
+static MOUSE_PRESENT:
+AtomicU8 =
     AtomicU8::new(0);
 
-static LAST_PRESSED: AtomicU8 =
+static LAST_USAGE:
+AtomicU8 =
+    AtomicU8::new(0);
+
+static LAST_PRESSED:
+AtomicU8 =
     AtomicU8::new(0);
 
 // ============================================================
@@ -59,12 +73,14 @@ unsafe fn outl(
     unsafe {
         asm!(
         "out dx, eax",
+
         in("dx") port,
         in("eax") value,
+
         options(
         nomem,
         nostack,
-        preserves_flags
+        preserves_flags,
         )
         );
     }
@@ -78,12 +94,14 @@ unsafe fn inl(
     unsafe {
         asm!(
         "in eax, dx",
+
         out("eax") value,
         in("dx") port,
+
         options(
         nomem,
         nostack,
-        preserves_flags
+        preserves_flags,
         )
         );
     }
@@ -110,7 +128,9 @@ unsafe fn pci_read_u32(
             address,
         );
 
-        inl(0xCFC)
+        inl(
+            0xCFC,
+        )
     }
 }
 
@@ -147,19 +167,22 @@ fn pci_read_u16(
     function: u8,
     offset: u8,
 ) -> u16 {
-    let value = unsafe {
-        pci_read_u32(
-            bus,
-            device,
-            function,
-            offset & !3,
-        )
-    };
+    let value =
+        unsafe {
+            pci_read_u32(
+                bus,
+                device,
+                function,
+                offset & !3,
+            )
+        };
 
     let shift =
-        ((offset & 2) * 8) as u32;
+        ((offset & 2) * 8)
+            as u32;
 
-    ((value >> shift) & 0xFFFF)
+    ((value >> shift)
+        & 0xFFFF)
         as u16
 }
 
@@ -169,19 +192,22 @@ fn pci_read_u8(
     function: u8,
     offset: u8,
 ) -> u8 {
-    let value = unsafe {
-        pci_read_u32(
-            bus,
-            device,
-            function,
-            offset & !3,
-        )
-    };
+    let value =
+        unsafe {
+            pci_read_u32(
+                bus,
+                device,
+                function,
+                offset & !3,
+            )
+        };
 
     let shift =
-        ((offset & 3) * 8) as u32;
+        ((offset & 3) * 8)
+            as u32;
 
-    ((value >> shift) & 0xFF)
+    ((value >> shift)
+        & 0xFF)
         as u8
 }
 
@@ -265,12 +291,10 @@ pub fn find_xhci_bar0()
                     continue;
                 }
 
-                //
-                // Enable:
-                //
-                // bit 1 = Memory Space
-                // bit 2 = Bus Master
-                //
+                // ------------------------------------------------
+                // Enable Memory Space + Bus Master
+                // ------------------------------------------------
+
                 let command =
                     pci_read_u16(
                         bus as u8,
@@ -309,9 +333,10 @@ pub fn find_xhci_bar0()
                     );
                 }
 
-                //
+                // ------------------------------------------------
                 // BAR0
-                //
+                // ------------------------------------------------
+
                 let bar0 =
                     unsafe {
                         pci_read_u32(
@@ -322,9 +347,7 @@ pub fn find_xhci_bar0()
                         )
                     };
 
-                //
                 // Must be a memory BAR.
-                //
                 if bar0 & 1 != 0 {
                     continue;
                 }
@@ -332,9 +355,10 @@ pub fn find_xhci_bar0()
                 let memory_type =
                     (bar0 >> 1) & 0x03;
 
-                //
-                // 64-bit memory BAR.
-                //
+                // ------------------------------------------------
+                // 64-bit memory BAR
+                // ------------------------------------------------
+
                 if memory_type == 0x02 {
                     let bar1 =
                         unsafe {
@@ -353,13 +377,14 @@ pub fn find_xhci_bar0()
 
                     if address != 0 {
                         return Some(
-                            address as usize
+                            address as usize,
                         );
                     }
                 } else {
-                    //
-                    // 32-bit memory BAR.
-                    //
+                    // ------------------------------------------------
+                    // 32-bit memory BAR
+                    // ------------------------------------------------
+
                     let address =
                         (bar0
                             & 0xFFFF_FFF0)
@@ -367,7 +392,7 @@ pub fn find_xhci_bar0()
 
                     if address != 0 {
                         return Some(
-                            address
+                            address,
                         );
                     }
                 }
@@ -399,6 +424,11 @@ pub unsafe fn init(
         Ordering::Release,
     );
 
+    MOUSE_PRESENT.store(
+        0,
+        Ordering::Release,
+    );
+
     LAST_USAGE.store(
         0,
         Ordering::Relaxed,
@@ -409,20 +439,22 @@ pub unsafe fn init(
         Ordering::Relaxed,
     );
 
-    //
+    // --------------------------------------------------------
     // xhci-nostd expects the controller MMIO address
     // to be directly accessible at the address passed to it.
     //
     // Therefore identity-map the xHCI BAR first.
-    //
+    // --------------------------------------------------------
+
     crate::memory::identity_map_mmio(
         bar0,
         0x10_0000,
     );
 
-    //
-    // NOW initialize xHCI.
-    //
+    // --------------------------------------------------------
+    // Initialize xHCI.
+    // --------------------------------------------------------
+
     let mut controller =
         unsafe {
             XhciController::init(
@@ -430,14 +462,16 @@ pub unsafe fn init(
             )
         };
 
-    //
+    // --------------------------------------------------------
     // Enumerate USB devices.
-    //
+    // --------------------------------------------------------
+
     controller.enumerate_ports();
 
-    //
+    // --------------------------------------------------------
     // Check for HID keyboard.
-    //
+    // --------------------------------------------------------
+
     if controller.has_keyboard() {
         KEYBOARD_PRESENT.store(
             1,
@@ -445,14 +479,36 @@ pub unsafe fn init(
         );
     }
 
-    //
+    // --------------------------------------------------------
+    // Check for HID mouse.
+    // --------------------------------------------------------
+
+    if controller.has_mouse() {
+        MOUSE_PRESENT.store(
+            1,
+            Ordering::Release,
+        );
+
+        crate::serial::write_str(
+            "usb: HID mouse detected\n",
+        );
+    } else {
+        crate::serial::write_str(
+            "usb: HID mouse not detected\n",
+        );
+    }
+
+    // --------------------------------------------------------
     // Store controller.
-    //
+    // --------------------------------------------------------
+
     unsafe {
         *CONTROLLER
             .controller
             .get() =
-            Some(controller);
+            Some(
+                controller,
+            );
     }
 
     INITIALIZED.store(
@@ -465,25 +521,29 @@ pub unsafe fn init(
 // Keyboard input
 // ============================================================
 
-pub fn read_key() -> Option<Key> {
+pub fn read_key()
+    -> Option<Key>
+{
     if INITIALIZED.load(
         Ordering::Acquire,
     ) == 0 {
         return None;
     }
 
-    let controller = unsafe {
-        (*CONTROLLER
-            .controller
-            .get())
-            .as_mut()?
-    };
+    let controller =
+        unsafe {
+            (*CONTROLLER
+                .controller
+                .get())
+                .as_mut()?
+        };
 
-    //
+    // --------------------------------------------------------
     // xhci-nostd processes the USB HID
     // interrupt transfer and gives us
     // a KeyEvent.
-    //
+    // --------------------------------------------------------
+
     let event =
         controller.poll_keyboard()?;
 
@@ -501,10 +561,11 @@ pub fn read_key() -> Option<Key> {
         Ordering::Relaxed,
     );
 
-    //
+    // --------------------------------------------------------
     // Rusty's UI currently wants key-down
     // events, not key-up events.
-    //
+    // --------------------------------------------------------
+
     if !event.pressed {
         return None;
     }
@@ -515,121 +576,288 @@ pub fn read_key() -> Option<Key> {
 }
 
 // ============================================================
+// Mouse input
+// ============================================================
+
+pub fn poll_mouse()
+    -> Option<MouseEvent>
+{
+    if INITIALIZED.load(
+        Ordering::Acquire,
+    ) == 0 {
+        return None;
+    }
+
+    let controller =
+        unsafe {
+            (*CONTROLLER
+                .controller
+                .get())
+                .as_mut()?
+        };
+
+    let event =
+        controller.poll_mouse()?;
+
+    Some(
+        MouseEvent {
+            buttons:
+            event.buttons,
+
+            dx:
+            event.dx,
+
+            dy:
+            event.dy,
+
+            wheel:
+            event.wheel,
+        },
+    )
+}
+
+// ============================================================
 // HID Usage → Rusty Key
 // ============================================================
 
 fn usage_to_key(
     usage: u8,
 ) -> Option<Key> {
-    Some(match usage {
-        // ----------------------------------------------------
-        // Letters
-        // ----------------------------------------------------
+    Some(
+        match usage {
+            // ------------------------------------------------
+            // Letters
+            // ------------------------------------------------
 
-        0x04 => Key::Character('a'),
-        0x05 => Key::Character('b'),
-        0x06 => Key::Character('c'),
-        0x07 => Key::Character('d'),
-        0x08 => Key::Character('e'),
-        0x09 => Key::Character('f'),
-        0x0A => Key::Character('g'),
-        0x0B => Key::Character('h'),
-        0x0C => Key::Character('i'),
-        0x0D => Key::Character('j'),
-        0x0E => Key::Character('k'),
-        0x0F => Key::Character('l'),
-        0x10 => Key::Character('m'),
-        0x11 => Key::Character('n'),
-        0x12 => Key::Character('o'),
-        0x13 => Key::Character('p'),
-        0x14 => Key::Character('q'),
-        0x15 => Key::Character('r'),
-        0x16 => Key::Character('s'),
-        0x17 => Key::Character('t'),
-        0x18 => Key::Character('u'),
-        0x19 => Key::Character('v'),
-        0x1A => Key::Character('w'),
-        0x1B => Key::Character('x'),
-        0x1C => Key::Character('y'),
-        0x1D => Key::Character('z'),
+            0x04 =>
+                Key::Character('a'),
 
-        // ----------------------------------------------------
-        // Numbers
-        // ----------------------------------------------------
+            0x05 =>
+                Key::Character('b'),
 
-        0x1E => Key::Character('1'),
-        0x1F => Key::Character('2'),
-        0x20 => Key::Character('3'),
-        0x21 => Key::Character('4'),
-        0x22 => Key::Character('5'),
-        0x23 => Key::Character('6'),
-        0x24 => Key::Character('7'),
-        0x25 => Key::Character('8'),
-        0x26 => Key::Character('9'),
-        0x27 => Key::Character('0'),
+            0x06 =>
+                Key::Character('c'),
 
-        // ----------------------------------------------------
-        // Controls
-        // ----------------------------------------------------
+            0x07 =>
+                Key::Character('d'),
 
-        0x28 => Key::Enter,
-        0x29 => Key::Escape,
-        0x2A => Key::Backspace,
-        0x2B => Key::Tab,
-        0x2C => Key::Space,
+            0x08 =>
+                Key::Character('e'),
 
-        // ----------------------------------------------------
-        // Punctuation
-        // ----------------------------------------------------
+            0x09 =>
+                Key::Character('f'),
 
-        0x2D => Key::Character('-'),
-        0x2E => Key::Character('='),
-        0x2F => Key::Character('['),
-        0x30 => Key::Character(']'),
-        0x31 => Key::Character('\\'),
-        0x33 => Key::Character(';'),
-        0x34 => Key::Character('\''),
-        0x35 => Key::Character('`'),
-        0x36 => Key::Character(','),
-        0x37 => Key::Character('.'),
-        0x38 => Key::Character('/'),
+            0x0A =>
+                Key::Character('g'),
 
-        // ----------------------------------------------------
-        // Navigation
-        // ----------------------------------------------------
+            0x0B =>
+                Key::Character('h'),
 
-        0x4F => Key::Right,
-        0x50 => Key::Left,
-        0x51 => Key::Down,
-        0x52 => Key::Up,
+            0x0C =>
+                Key::Character('i'),
 
-        _ => return None,
-    })
+            0x0D =>
+                Key::Character('j'),
+
+            0x0E =>
+                Key::Character('k'),
+
+            0x0F =>
+                Key::Character('l'),
+
+            0x10 =>
+                Key::Character('m'),
+
+            0x11 =>
+                Key::Character('n'),
+
+            0x12 =>
+                Key::Character('o'),
+
+            0x13 =>
+                Key::Character('p'),
+
+            0x14 =>
+                Key::Character('q'),
+
+            0x15 =>
+                Key::Character('r'),
+
+            0x16 =>
+                Key::Character('s'),
+
+            0x17 =>
+                Key::Character('t'),
+
+            0x18 =>
+                Key::Character('u'),
+
+            0x19 =>
+                Key::Character('v'),
+
+            0x1A =>
+                Key::Character('w'),
+
+            0x1B =>
+                Key::Character('x'),
+
+            0x1C =>
+                Key::Character('y'),
+
+            0x1D =>
+                Key::Character('z'),
+
+            // ------------------------------------------------
+            // Numbers
+            // ------------------------------------------------
+
+            0x1E =>
+                Key::Character('1'),
+
+            0x1F =>
+                Key::Character('2'),
+
+            0x20 =>
+                Key::Character('3'),
+
+            0x21 =>
+                Key::Character('4'),
+
+            0x22 =>
+                Key::Character('5'),
+
+            0x23 =>
+                Key::Character('6'),
+
+            0x24 =>
+                Key::Character('7'),
+
+            0x25 =>
+                Key::Character('8'),
+
+            0x26 =>
+                Key::Character('9'),
+
+            0x27 =>
+                Key::Character('0'),
+
+            // ------------------------------------------------
+            // Controls
+            // ------------------------------------------------
+
+            0x28 =>
+                Key::Enter,
+
+            0x29 =>
+                Key::Escape,
+
+            0x2A =>
+                Key::Backspace,
+
+            0x2B =>
+                Key::Tab,
+
+            0x2C =>
+                Key::Space,
+
+            // ------------------------------------------------
+            // Punctuation
+            // ------------------------------------------------
+
+            0x2D =>
+                Key::Character('-'),
+
+            0x2E =>
+                Key::Character('='),
+
+            0x2F =>
+                Key::Character('['),
+
+            0x30 =>
+                Key::Character(']'),
+
+            0x31 =>
+                Key::Character('\\'),
+
+            0x33 =>
+                Key::Character(';'),
+
+            0x34 =>
+                Key::Character('\''),
+
+            0x35 =>
+                Key::Character('`'),
+
+            0x36 =>
+                Key::Character(','),
+
+            0x37 =>
+                Key::Character('.'),
+
+            0x38 =>
+                Key::Character('/'),
+
+            // ------------------------------------------------
+            // Navigation
+            // ------------------------------------------------
+
+            0x4F =>
+                Key::Right,
+
+            0x50 =>
+                Key::Left,
+
+            0x51 =>
+                Key::Down,
+
+            0x52 =>
+                Key::Up,
+
+            _ =>
+                return None,
+        },
+    )
 }
 
 // ============================================================
 // Diagnostics
 // ============================================================
 
-pub fn is_initialized() -> bool {
+pub fn is_initialized()
+    -> bool
+{
     INITIALIZED.load(
         Ordering::Acquire,
     ) != 0
 }
 
-pub fn has_keyboard() -> bool {
+pub fn has_keyboard()
+    -> bool
+{
     KEYBOARD_PRESENT.load(
         Ordering::Acquire,
     ) != 0
 }
 
-pub fn last_usage() -> u8 {
+pub fn has_mouse()
+    -> bool
+{
+    MOUSE_PRESENT.load(
+        Ordering::Acquire,
+    ) != 0
+}
+
+pub fn last_usage()
+    -> u8
+{
     LAST_USAGE.load(
         Ordering::Relaxed,
     )
 }
 
-pub fn last_pressed() -> bool {
+pub fn last_pressed()
+    -> bool
+{
     LAST_PRESSED.load(
         Ordering::Relaxed,
     ) != 0
