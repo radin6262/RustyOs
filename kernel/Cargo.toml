@@ -26,6 +26,12 @@ spin = "0.9.8"
 
 xhci-nostd = { path = "../xhci" }
 
-wasmi = { version = "1.1.0", default-features = false }
 
-xmas-elf = "0.9.0"
+ax-sync = { version = "0.6.0", default-features = false }
+ax-crate-interface = { version = "0.5.8", default-features = false }
+
+crab-usb = { version = "0.12.1", default-features = false }
+dma-api = { version = "0.10.2", default-features = false }
+
+derive_more = { version = "2.1.1", default-features = false, features = ["full"] }
+thiserror = { version = "2", default-features = false }

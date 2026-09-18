@@ -21,10 +21,13 @@ mod wm;
 mod delay;
 mod elf;
 mod launch_app;
+mod xhci_pci;
+mod usb;
+mod ax_sync;
 
-use bootloader_api::{
-    config::{BootloaderConfig, Mapping},
-    entry_point, BootInfo,
+use bootloader_api::{BootInfo,
+                     config::{BootloaderConfig, Mapping},
+                     entry_point,
 };
 
 // ============================================================
@@ -78,7 +81,7 @@ fn kernel_main(
 
     launch_app::run(
         selectors,
-        include_bytes!("../../user/launcher/Launcher"),
+        include_bytes!("../../user/terminal/Terminal"),
     );
 
 

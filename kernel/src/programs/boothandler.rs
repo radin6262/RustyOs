@@ -228,13 +228,35 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     // WASM runtime
     // ========================================================
 
-    serial::write_str("finishing boot sequence...\n");
-    update_boot_status(3, 0xFFCBA6F7, "Task 4/4: Finalizing...");
-    //
-    // wasm::run_demo();
-    //
-    update_boot_status(3, 0xFFA6E3A1, "Task 4/4: Boot Sequence Complete!");
-    serial::write_str("Boot sequence finished successfully\n");
+    // serial::write_str("finishing boot sequence...\n");
+    // update_boot_status(3, 0xFFCBA6F7, "Task 4/4: Finalizing...");
+    // //
+    // // wasm::run_demo();
+    // //
+    // update_boot_status(3, 0xFFA6E3A1, "Task 4/4: Boot Sequence Complete!");
+    // serial::write_str("Boot sequence finished successfully\n");
+
+    serial::write_str(
+        "BOOT: initializing USB...\n",
+    );
+
+    crate::usb::init::init();
+
+
+
+    serial::write_str(
+        "BOOT: USB initialization complete\n",
+    );
+
+    crate::serial::write_str(
+        "BOOT: calling USB poll...\n",
+    );
+
+    crate::usb::poll::poll();
+
+    crate::serial::write_str(
+        "BOOT: USB poll returned\n",
+    );
 
     crate::delay::delay_seconds(1);
 
