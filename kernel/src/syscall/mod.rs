@@ -312,10 +312,20 @@ extern "C" fn rusty_syscall_dispatch(
     interrupt: *mut UserInterruptFrame,
 ) -> u64 {
     // --------------------------------------------------------
-    // Service physical mouse input on every kernel entry.
+    // Pump USB before servicing input.
     //
-    // This updates the compositor cursor using the small
-    // cursor-only path. It does NOT redraw the entire desktop.
+    // This keeps CrabUSB running while userspace is executing.
+    // There is intentionally NO permanent USB loop in the boot
+    // handler, otherwise Ring 3 would never be reached.
+    // --------------------------------------------------------
+
+    service_usb();
+
+    // --------------------------------------------------------
+    // Service physical mouse input.
+    //
+    // USB polling above produces input events. The compositor
+    // consumes mouse events and updates only the cursor region.
     // --------------------------------------------------------
 
     service_mouse();
@@ -618,28 +628,35 @@ fn syscall_write(
 
 // ============================================================
 // SYS_READ
+// fd  = rdi
+// buf = rsi
+// len = rdx
+//
+// Reads keyboard input from the kernel input event queue.
+//
+// Returns:
+//   1  = one byte read
+//   0  = no input available / yielded
+//   u64::MAX = error
 // ============================================================
 
 fn syscall_read(
     frame: &mut SyscallFrame,
     interrupt: &mut UserInterruptFrame,
 ) -> u64 {
-    let fd =
-        frame.rdi;
+    let fd = frame.rdi;
+    let address = frame.rsi;
 
-    let address =
-        frame.rsi;
+    let length = match usize::try_from(frame.rdx) {
+        Ok(length) => length,
+        Err(_) => {
+            return u64::MAX;
+        }
+    };
 
-    let length =
-        match usize::try_from(
-            frame.rdx,
-        ) {
-            Ok(length) =>
-                length,
-
-            Err(_) =>
-                return u64::MAX,
-        };
+    // --------------------------------------------------------
+    // stdin
+    // --------------------------------------------------------
 
     if fd != 0 {
         crate::serial::write_str(
@@ -649,11 +666,23 @@ fn syscall_read(
         return u64::MAX;
     }
 
+    // --------------------------------------------------------
+    // Nothing to read.
+    // --------------------------------------------------------
+
+    if length == 0 {
+        return 0;
+    }
+
+    // --------------------------------------------------------
+    // Validate userspace destination.
+    // --------------------------------------------------------
+
     if !unsafe {
         crate::memory::validate_user_range(
             crate::memory::current_level_4_frame(),
             address,
-            length,
+            1,
             true,
         )
     } {
@@ -664,90 +693,286 @@ fn syscall_read(
         return u64::MAX;
     }
 
-    // Attempt to poll keyboard input non-blocking
-    if let Some(key) =
-        crate::input::read_key()
-    {
-        let ascii_byte =
-            match key {
-                crate::input::Key::Character(
-                    c,
-                ) =>
-                    c as u8,
+    // --------------------------------------------------------
+    // Look for a keyboard event.
+    //
+    // The new input system uses:
+    //
+    //     InputEvent::KeyDown
+    //     InputEvent::KeyUp
+    //
+    // We only want KeyDown here.
+    // --------------------------------------------------------
 
-                crate::input::Key::Enter =>
-                    b'\n',
-
-                crate::input::Key::Space =>
-                    b' ',
-
-                crate::input::Key::Backspace =>
-                    0x08,
-
-                _ =>
-                    0,
-            };
-
-        if ascii_byte != 0 {
-            unsafe {
-                *(address as *mut u8) =
-                    ascii_byte;
-            }
-
-            return 1;
-        } else {
-            return 0;
-        }
-    } else {
-        // Save original RIP prior to rewinding
-        // for yield execution.
-        let original_rip =
-            interrupt.rip;
-
-        // No keystroke available:
-        //
-        // Rewind RIP past `int 0x80` so the syscall will
-        // execute again when this process resumes.
-        interrupt.rip =
-            interrupt.rip
-                .checked_sub(2)
-                .unwrap_or(
-                    interrupt.rip,
+    while let Some(event) = crate::input::poll_keyboard_event() {
+        match event {
+            crate::input::InputEvent::KeyDown {
+                key,
+                modifiers,
+            } => {
+                let ascii = key_to_ascii(
+                    key,
+                    modifiers,
                 );
 
-        let current_context =
-            save_context(
+                if ascii == 0 {
+                    // Non-printable key.
+                    //
+                    // Keep looking for another keyboard event.
+                    continue;
+                }
+
+                unsafe {
+                    *(address as *mut u8) = ascii;
+                }
+
+                return 1;
+            }
+
+            // KeyUp is not input for stdin.
+            crate::input::InputEvent::KeyUp { .. } => {
+                continue;
+            }
+
+            // Mouse events are not stdin data.
+            //
+            // NOTE:
+            // With the current single InputEvent queue, consuming
+            // these here means they are removed from the queue.
+            // The compositor should therefore not compete with
+            // SYS_READ for the same queue.
+            crate::input::InputEvent::MouseMove { .. } => {
+                continue;
+            }
+
+            crate::input::InputEvent::MouseButtonDown(_) => {
+                continue;
+            }
+
+            crate::input::InputEvent::MouseButtonUp(_) => {
+                continue;
+            }
+
+            crate::input::InputEvent::MouseWheel { .. } => {
+                continue;
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    // No keyboard input available.
+    //
+    // Rewind RIP so that when this process is scheduled again,
+    // the same INT 0x80 SYS_READ instruction executes again.
+    // --------------------------------------------------------
+
+    let original_rip = interrupt.rip;
+
+    interrupt.rip = interrupt
+        .rip
+        .checked_sub(2)
+        .unwrap_or(interrupt.rip);
+
+    let current_context = save_context(
+        frame,
+        interrupt,
+    );
+
+    match crate::process::yield_current(
+        current_context,
+    ) {
+        ScheduleResult::Switched(context) => {
+            load_context(
+                context,
                 frame,
                 interrupt,
             );
 
-        match crate::process::yield_current(
-            current_context,
-        ) {
-            ScheduleResult::Switched(
-                context,
-            ) => {
-                load_context(
-                    context,
-                    frame,
-                    interrupt,
-                );
+            SYSCALL_SWITCH
+        }
 
-                SYSCALL_SWITCH
-            }
+        ScheduleResult::NoProcess => {
+            // Nothing else to schedule.
+            // Restore the original RIP so we do not accidentally
+            // re-execute the INT 0x80 instruction.
+            interrupt.rip = original_rip;
 
-            ScheduleResult::NoProcess => {
-                // If no context switch took place,
-                // restore original RIP.
-                interrupt.rip =
-                    original_rip;
-
-                0
-            }
+            0
         }
     }
 }
 
+// ============================================================
+// Convert a physical keyboard key + modifiers into ASCII.
+//
+// Returns 0 when the key has no ASCII representation.
+// ============================================================
+
+fn key_to_ascii(
+    key: crate::input::Key,
+    modifiers: crate::input::Modifiers,
+) -> u8 {
+    let shift =
+        modifiers.left_shift ||
+            modifiers.right_shift;
+
+    match key {
+        crate::input::Key::A =>
+            if shift { b'A' } else { b'a' },
+
+        crate::input::Key::B =>
+            if shift { b'B' } else { b'b' },
+
+        crate::input::Key::C =>
+            if shift { b'C' } else { b'c' },
+
+        crate::input::Key::D =>
+            if shift { b'D' } else { b'd' },
+
+        crate::input::Key::E =>
+            if shift { b'E' } else { b'e' },
+
+        crate::input::Key::F =>
+            if shift { b'F' } else { b'f' },
+
+        crate::input::Key::G =>
+            if shift { b'G' } else { b'g' },
+
+        crate::input::Key::H =>
+            if shift { b'H' } else { b'h' },
+
+        crate::input::Key::I =>
+            if shift { b'I' } else { b'i' },
+
+        crate::input::Key::J =>
+            if shift { b'J' } else { b'j' },
+
+        crate::input::Key::K =>
+            if shift { b'K' } else { b'k' },
+
+        crate::input::Key::L =>
+            if shift { b'L' } else { b'l' },
+
+        crate::input::Key::M =>
+            if shift { b'M' } else { b'm' },
+
+        crate::input::Key::N =>
+            if shift { b'N' } else { b'n' },
+
+        crate::input::Key::O =>
+            if shift { b'O' } else { b'o' },
+
+        crate::input::Key::P =>
+            if shift { b'P' } else { b'p' },
+
+        crate::input::Key::Q =>
+            if shift { b'Q' } else { b'q' },
+
+        crate::input::Key::R =>
+            if shift { b'R' } else { b'r' },
+
+        crate::input::Key::S =>
+            if shift { b'S' } else { b's' },
+
+        crate::input::Key::T =>
+            if shift { b'T' } else { b't' },
+
+        crate::input::Key::U =>
+            if shift { b'U' } else { b'u' },
+
+        crate::input::Key::V =>
+            if shift { b'V' } else { b'v' },
+
+        crate::input::Key::W =>
+            if shift { b'W' } else { b'w' },
+
+        crate::input::Key::X =>
+            if shift { b'X' } else { b'x' },
+
+        crate::input::Key::Y =>
+            if shift { b'Y' } else { b'y' },
+
+        crate::input::Key::Z =>
+            if shift { b'Z' } else { b'z' },
+
+        crate::input::Key::Num1 =>
+            if shift { b'!' } else { b'1' },
+
+        crate::input::Key::Num2 =>
+            if shift { b'@' } else { b'2' },
+
+        crate::input::Key::Num3 =>
+            if shift { b'#' } else { b'3' },
+
+        crate::input::Key::Num4 =>
+            if shift { b'$' } else { b'4' },
+
+        crate::input::Key::Num5 =>
+            if shift { b'%' } else { b'5' },
+
+        crate::input::Key::Num6 =>
+            if shift { b'^' } else { b'6' },
+
+        crate::input::Key::Num7 =>
+            if shift { b'&' } else { b'7' },
+
+        crate::input::Key::Num8 =>
+            if shift { b'*' } else { b'8' },
+
+        crate::input::Key::Num9 =>
+            if shift { b'(' } else { b'9' },
+
+        crate::input::Key::Num0 =>
+            if shift { b')' } else { b'0' },
+
+        crate::input::Key::Enter =>
+            b'\n',
+
+        crate::input::Key::Space =>
+            b' ',
+
+        crate::input::Key::Tab =>
+            b'\t',
+
+        crate::input::Key::Backspace =>
+            0x08,
+
+        crate::input::Key::Minus =>
+            if shift { b'_' } else { b'-' },
+
+        crate::input::Key::Equal =>
+            if shift { b'+' } else { b'=' },
+
+        crate::input::Key::LeftBracket =>
+            if shift { b'{' } else { b'[' },
+
+        crate::input::Key::RightBracket =>
+            if shift { b'}' } else { b']' },
+
+        crate::input::Key::Backslash =>
+            if shift { b'|' } else { b'\\' },
+
+        crate::input::Key::Semicolon =>
+            if shift { b':' } else { b';' },
+
+        crate::input::Key::Apostrophe =>
+            if shift { b'"' } else { b'\'' },
+
+        crate::input::Key::Grave =>
+            if shift { b'~' } else { b'`' },
+
+        crate::input::Key::Comma =>
+            if shift { b'<' } else { b',' },
+
+        crate::input::Key::Dot =>
+            if shift { b'>' } else { b'.' },
+
+        crate::input::Key::Slash =>
+            if shift { b'?' } else { b'/' },
+
+        _ => 0,
+    }
+}
 // ============================================================
 // SYS_SLEEP
 // ============================================================
@@ -1430,6 +1655,33 @@ fn syscall_launch_app(
 //
 // There is NO full-screen compositor redraw here.
 //
+
+// ============================================================
+// USB/input service
+// ============================================================
+//
+// USB is deliberately NOT polled from the boot handler.
+//
+// Userspace enters the kernel through syscalls, and every
+// syscall entry pumps CrabUSB once. This allows:
+//
+//     Ring 3
+//        ↓
+//     syscall
+//        ↓
+//     USB poll
+//        ↓
+//     input events
+//        ↓
+//     return to Ring 3
+//
+// SYS_READ can therefore yield when no keyboard input exists,
+// and the next syscall/kernel entry will pump USB again.
+//
+
+fn service_usb() {
+    crate::usb::poll::poll();
+}
 
 fn service_mouse() {
     let mut wm_lock =

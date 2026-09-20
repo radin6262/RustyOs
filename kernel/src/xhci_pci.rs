@@ -1,5 +1,6 @@
 use core::arch::asm;
 
+use crate::serial;
 // ============================================================
 // PCI configuration mechanism #1
 // ============================================================
@@ -772,4 +773,234 @@ pub fn find_xhci()
     }
 
     None
+}
+
+pub fn debug_dump_ports(
+    mmio_base: usize,
+) {
+    serial::write_str(
+        "xHCI: PORT DUMP BEGIN\n",
+    );
+
+    let cap_length =
+        unsafe {
+            core::ptr::read_volatile(
+                (mmio_base + 0x00)
+                    as *const u8,
+            )
+        } as usize;
+
+    let op_base =
+        mmio_base + cap_length;
+
+    let hcsparams1 =
+        unsafe {
+            core::ptr::read_volatile(
+                (mmio_base + 0x04)
+                    as *const u32,
+            )
+        };
+
+    let max_ports =
+        ((hcsparams1 >> 24) & 0xFF)
+            as usize;
+
+    serial::write_str(
+        "xHCI: BASE=",
+    );
+    serial::write_hex(
+        mmio_base as u64,
+    );
+    serial::write_str(
+        " CAP=",
+    );
+    serial::write_hex(
+        cap_length as u64,
+    );
+    serial::write_str(
+        " OP=",
+    );
+    serial::write_hex(
+        op_base as u64,
+    );
+    serial::write_str(
+        " PORTS=",
+    );
+    serial::write_usize(
+        max_ports,
+    );
+    serial::write_str(
+        "\n",
+    );
+
+    for port in 0..max_ports {
+        let address =
+            op_base
+                + 0x400
+                + (port * 0x10);
+
+        let portsc =
+            unsafe {
+                core::ptr::read_volatile(
+                    address as *const u32,
+                )
+            };
+
+        let portpmsc =
+            unsafe {
+                core::ptr::read_volatile(
+                    (address + 0x04)
+                        as *const u32,
+                )
+            };
+
+        let portli =
+            unsafe {
+                core::ptr::read_volatile(
+                    (address + 0x08)
+                        as *const u32,
+                )
+            };
+
+        let porthlpmc =
+            unsafe {
+                core::ptr::read_volatile(
+                    (address + 0x0C)
+                        as *const u32,
+                )
+            };
+
+        let ccs =
+            (portsc & (1 << 0)) != 0;
+
+        let ped =
+            (portsc & (1 << 1)) != 0;
+
+        let pr =
+            (portsc & (1 << 4)) != 0;
+
+        let pls =
+            (portsc >> 5) & 0xF;
+
+        let pp =
+            (portsc & (1 << 9)) != 0;
+
+        let speed =
+            (portsc >> 10) & 0xF;
+
+        let csc =
+            (portsc & (1 << 17)) != 0;
+
+        let pec =
+            (portsc & (1 << 18)) != 0;
+
+        let prc =
+            (portsc & (1 << 21)) != 0;
+
+        serial::write_str(
+            "xHCI: P",
+        );
+        serial::write_usize(
+            port + 1,
+        );
+
+        serial::write_str(
+            " SC=",
+        );
+        serial::write_hex(
+            portsc as u64,
+        );
+
+        serial::write_str(
+            " PMSC=",
+        );
+        serial::write_hex(
+            portpmsc as u64,
+        );
+
+        serial::write_str(
+            " LI=",
+        );
+        serial::write_hex(
+            portli as u64,
+        );
+
+        serial::write_str(
+            " HLPMC=",
+        );
+        serial::write_hex(
+            porthlpmc as u64,
+        );
+
+        serial::write_str(
+            " | CCS=",
+        );
+        serial::write_usize(
+            ccs as usize,
+        );
+
+        serial::write_str(
+            " PED=",
+        );
+        serial::write_usize(
+            ped as usize,
+        );
+
+        serial::write_str(
+            " PR=",
+        );
+        serial::write_usize(
+            pr as usize,
+        );
+
+        serial::write_str(
+            " PP=",
+        );
+        serial::write_usize(
+            pp as usize,
+        );
+
+        serial::write_str(
+            " PLS=",
+        );
+        serial::write_usize(
+            pls as usize,
+        );
+
+        serial::write_str(
+            " SPEED=",
+        );
+        serial::write_usize(
+            speed as usize,
+        );
+
+        serial::write_str(
+            " CSC=",
+        );
+        serial::write_usize(
+            csc as usize,
+        );
+
+        serial::write_str(
+            " PEC=",
+        );
+        serial::write_usize(
+            pec as usize,
+        );
+
+        serial::write_str(
+            " PRC=",
+        );
+        serial::write_usize(
+            prc as usize,
+        );
+
+        serial::write_str(
+            "\n",
+        );
+    }
+
+    serial::write_str(
+        "xHCI: PORT DUMP END\n",
+    );
 }

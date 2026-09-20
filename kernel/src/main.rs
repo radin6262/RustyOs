@@ -55,26 +55,26 @@ fn kernel_main(
         boot_info,
     );
 
-    if let Some(mouse) = crate::input::poll_mouse() {
-        crate::serial::write_str("MOUSE EVENT\n");
-
-        crate::serial::write_str("dx=");
-        crate::serial::write_hex(
-            mouse.dx as i64 as u64,
-        );
-
-        crate::serial::write_str(" dy=");
-        crate::serial::write_hex(
-            mouse.dy as i64 as u64,
-        );
-
-        crate::serial::write_str(" buttons=");
-        crate::serial::write_usize(
-            mouse.buttons as usize,
-        );
-
-        crate::serial::write_str("\n");
-    }
+    // if let Some(mouse) = crate::input::poll_mouse() {
+    //     crate::serial::write_str("MOUSE EVENT\n");
+    //
+    //     crate::serial::write_str("dx=");
+    //     crate::serial::write_hex(
+    //         mouse.dx as i64 as u64,
+    //     );
+    //
+    //     crate::serial::write_str(" dy=");
+    //     crate::serial::write_hex(
+    //         mouse.dy as i64 as u64,
+    //     );
+    //
+    //     crate::serial::write_str(" buttons=");
+    //     crate::serial::write_usize(
+    //         mouse.buttons as usize,
+    //     );
+    //
+    //     crate::serial::write_str("\n");
+    // }
 
     let selectors =
         cpu::gdt::init();

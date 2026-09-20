@@ -1,6 +1,8 @@
 use core::{
     cell::UnsafeCell,
+    future::Future,
     mem::MaybeUninit,
+    pin::Pin,
     ptr::NonNull,
     sync::atomic::{
         AtomicU8,
@@ -8,7 +10,10 @@ use core::{
     },
 };
 
-use alloc::vec::Vec;
+use alloc::{
+    boxed::Box,
+    vec::Vec,
+};
 
 use crab_usb::{
     Device,
@@ -25,13 +30,10 @@ use crate::{
 
 use crate::memory::dma::usb_device_dma;
 
+use super::devices::HidDeviceKind;
+
 // ============================================================
 // Runtime
-// ============================================================
-//
-// CrabUSB uses KernelOp for operations that need to interact
-// with the kernel, such as delays.
-//
 // ============================================================
 
 pub struct RustyUsbRuntime;
@@ -52,13 +54,68 @@ RustyUsbRuntime =
     RustyUsbRuntime;
 
 // ============================================================
-// USB state
+// HID input task
 // ============================================================
 //
-// This contains the persistent CrabUSB state.
+// We intentionally do NOT name CrabUSB's Interface or Endpoint
+// types here.
 //
-// The actual device classification is handled by devices.rs.
+// CrabUSB 0.12.x returns those values from:
 //
+//     device.claim_interface(...)
+//     interface.endpoint_bulk_in(...)
+//
+// The concrete types are kept inside this boxed future.
+//
+// This allows the future to own the interface + endpoint for
+// the lifetime of the HID device without depending on private
+// CrabUSB type names.
+//
+// ============================================================
+
+pub(crate) type HidInputTask =
+Pin<
+    Box<
+        dyn Future<Output = ()> + 'static
+    >
+>;
+
+// ============================================================
+// HID input state
+// ============================================================
+
+pub(crate) struct HidInputDevice {
+    // --------------------------------------------------------
+    // HID device type
+    // --------------------------------------------------------
+
+    pub(crate) kind:
+        HidDeviceKind,
+
+    // --------------------------------------------------------
+    // USB endpoint address
+    // --------------------------------------------------------
+
+    pub(crate) endpoint_address:
+        u8,
+
+    // --------------------------------------------------------
+    // Maximum interrupt packet size
+    // --------------------------------------------------------
+
+    pub(crate) packet_size:
+        usize,
+
+    // --------------------------------------------------------
+    // Persistent HID transfer task
+    // --------------------------------------------------------
+
+    pub(crate) task:
+        HidInputTask,
+}
+
+// ============================================================
+// USB state
 // ============================================================
 
 pub(crate) struct UsbState {
@@ -79,21 +136,19 @@ pub(crate) struct UsbState {
     // --------------------------------------------------------
     // Opened USB devices
     // --------------------------------------------------------
-    //
-    // These are kept alive after open_device() succeeds.
-    //
-    // --------------------------------------------------------
 
     pub(crate) devices:
         Vec<Device>,
 
     // --------------------------------------------------------
-    // Initial device scan
+    // HID devices
     // --------------------------------------------------------
-    //
-    // Prevents the initial probe from being performed every
-    // time usb::poll() runs.
-    //
+
+    pub(crate) hid_devices:
+        Vec<HidInputDevice>,
+
+    // --------------------------------------------------------
+    // Initial device scan
     // --------------------------------------------------------
 
     pub(crate) devices_scanned:
@@ -142,11 +197,8 @@ AtomicU8 =
 //
 // SAFETY:
 //
-// The caller must ensure that USB state is not accessed
-// concurrently.
-//
-// Rusty's current kernel USB polling path is single-threaded,
-// so this is currently acceptable.
+// Rusty's USB subsystem currently runs through the
+// single-threaded kernel polling path.
 //
 // ============================================================
 
@@ -181,23 +233,104 @@ pub fn is_initialized()
     ) != 0
 }
 
+// Check xhci ports
+unsafe fn power_on_xhci_ports(
+    bar0: usize,
+) {
+    //
+    // xHCI capability registers
+    //
+    let cap_base =
+        bar0 as *mut u8;
+
+    let cap_length =
+        core::ptr::read_volatile(
+            cap_base
+                .add(0x00)
+        ) as usize;
+
+
+    //
+    // Operational registers start here
+    //
+    let op_base =
+        bar0 + cap_length;
+
+
+    //
+    // Read HCSPARAMS1
+    //
+    let hcsparams1 =
+        core::ptr::read_volatile(
+            (cap_base.add(0x04))
+                as *const u32,
+        );
+
+
+    let max_ports =
+        (hcsparams1 & 0xff)
+            as usize;
+
+
+    serial::write_str(
+        "USB: xHCI ports=",
+    );
+
+    serial::write_usize(
+        max_ports,
+    );
+
+    serial::write_str(
+        "\n",
+    );
+
+
+    //
+    // PORTSC registers
+    //
+    // PORTSC1 = operational + 0x400
+    //
+    let portsc_base =
+        op_base + 0x400;
+
+
+    for port in 0..max_ports {
+
+        let portsc =
+            (portsc_base
+                + port * 0x10)
+                as *mut u32;
+
+
+        let mut value =
+            core::ptr::read_volatile(
+                portsc,
+            );
+
+
+        //
+        // Port Power bit
+        //
+        // xHCI spec:
+        // PORTSC.PP = bit 9
+        //
+        value |= 1 << 9;
+
+
+        core::ptr::write_volatile(
+            portsc,
+            value,
+        );
+    }
+
+
+    serial::write_str(
+        "USB: xHCI ports powered\n",
+    );
+}
+
 // ============================================================
 // Initialize USB
-// ============================================================
-//
-// Initialization pipeline:
-//
-// 1. Find PCI xHCI controller
-// 2. Map xHCI MMIO
-// 3. Create USB DMA allocator/device
-// 4. Create CrabUSB xHCI host
-// 5. Create CrabUSB event handler
-// 6. Initialize xHCI
-// 7. Publish USB state
-//
-// Device probing and HID classification happen later from
-// usb::poll().
-//
 // ============================================================
 
 pub fn init() {
@@ -279,6 +412,12 @@ pub fn init() {
         controller.bar0_size
             as usize;
 
+    if bar0 == 0 {
+        panic!(
+            "Rusty: xHCI BAR0 is zero",
+        );
+    }
+
     if bar0_size == 0 {
         panic!(
             "Rusty: xHCI BAR0 size is zero",
@@ -302,15 +441,6 @@ pub fn init() {
 
     // ========================================================
     // Create USB DMA device
-    // ========================================================
-    //
-    // CrabUSB needs DMA-capable memory for:
-    //
-    // - command/event rings
-    // - device contexts
-    // - transfer rings
-    // - USB transfer buffers
-    //
     // ========================================================
 
     let dma =
@@ -365,11 +495,6 @@ pub fn init() {
     // ========================================================
     // Create event handler
     // ========================================================
-    //
-    // This is used by the kernel polling loop and by the
-    // synchronous future executor in poll.rs.
-    //
-    // ========================================================
 
     let event_handler =
         host.create_event_handler();
@@ -379,7 +504,7 @@ pub fn init() {
     );
 
     // ========================================================
-    // Initialize xHCI controller
+    // Initialize xHCI
     // ========================================================
 
     serial::write_str(
@@ -397,6 +522,14 @@ pub fn init() {
             serial::write_str(
                 "USB: xHCI controller initialized\n",
             );
+
+            // ====================================================
+            // DEBUG: dump xHCI ports
+            // ====================================================
+
+            xhci_pci::debug_dump_ports(
+                bar0,
+            );
         }
 
         Err(error) => {
@@ -410,24 +543,19 @@ pub fn init() {
     // ========================================================
     // Publish USB state
     // ========================================================
-    //
-    // From this point onward usb::poll() may access the state.
-    //
-    // IMPORTANT:
-    //
-    // USB_INITIALIZED is intentionally set only AFTER the
-    // entire UsbState has been initialized.
-    //
-    // ========================================================
 
     unsafe {
         (*USB_STORAGE.state.get())
             .write(
                 UsbState {
                     host,
+
                     event_handler,
 
                     devices:
+                    Vec::new(),
+
+                    hid_devices:
                     Vec::new(),
 
                     devices_scanned:

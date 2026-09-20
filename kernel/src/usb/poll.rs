@@ -11,7 +11,13 @@ use core::{
     },
 };
 
+use alloc::{
+    boxed::Box,
+    vec::Vec,
+};
+
 use crab_usb::{
+    usb_if::endpoint::TransferRequest,
     EventHandler,
     ProbedDevice,
 };
@@ -27,559 +33,630 @@ use super::{
 //
 // Called repeatedly from Rusty's kernel loop.
 //
+// Normal polling is intentionally SILENT.
+//
+// High-frequency serial logging inside this function can
+// completely dominate the kernel loop because UART output is
+// dramatically slower than CPU execution.
+//
+// Meaningful events are still logged:
+//   - device discovery
+//   - HID device setup
+//   - HID task startup
+//   - completed HID transfers
+//   - HID transfer errors
+//   - device disconnects
+//
 // Pipeline:
 //
 // 1. process pending xHCI events
-// 2. probe for connected/disconnected USB devices
-// 3. inspect USB interfaces
-// 4. classify HID devices
-// 5. open newly discovered USB devices
-// 6. claim HID interfaces
-// 7. store opened devices
+// 2. poll existing HID transfers
+// 3. process xHCI events again
+// 4. probe for connected USB devices
+// 5. inspect USB interfaces
+// 6. classify HID devices
+// 7. open newly discovered USB devices
+// 8. claim HID interfaces
+// 9. obtain EndpointHandle
+// 10. perform persistent HID interrupt-IN transfers
+// 11. keep opened Device alive in UsbState
 //
-// devices.rs owns USB/HID classification.
+// CrabUSB API:
 //
-// poll.rs owns:
+// Device::claim_interface()
+//     -> Future<Output = Result<InterfaceSession, USBError>>
 //
-// - USB device lifetime
-// - USB polling
-// - interface claiming
+// InterfaceSession::endpoint()
+//     -> Result<EndpointHandle, USBError>
 //
-// Actual HID transfers are performed after the devices have
-// been successfully opened and claimed.
+// EndpointHandle::wait()
+//     -> Future<
+//          Output = Result<TransferCompletion, TransferError>
+//        >
+//
+// TransferRequest::interrupt_in(&mut [u8])
 //
 // ============================================================
 
 pub fn poll() {
-    crate::serial::write_str(
-        "USB POLL: entered\n",
-    );
-
-    // ========================================================
-    // Check initialization
-    // ========================================================
-
     if !init::is_initialized() {
-        crate::serial::write_str(
-            "USB POLL: subsystem not initialized\n",
-        );
-
         return;
     }
 
-    crate::serial::write_str(
-        "USB POLL: subsystem initialized\n",
-    );
-
     unsafe {
-        let state =
-            init::state_mut();
+        let state = init::state_mut();
 
         // ====================================================
-        // Process pending xHCI events
+        // Process xHCI events
+        // ====================================================
+        //
+        // This handles completions from transfers that were
+        // submitted during previous polls.
+
+        state.event_handler.handle_event();
+
+        // ====================================================
+        // Poll existing HID input tasks
         // ====================================================
 
-        crate::serial::write_str(
-            "USB POLL: processing xHCI events...\n",
-        );
+        if !state.hid_devices.is_empty() {
+            let waker = noop_waker();
 
-        state
-            .event_handler
-            .handle_event();
+            let mut context =
+                Context::from_waker(
+                    &waker,
+                );
 
-        crate::serial::write_str(
-            "USB POLL: xHCI event processing complete\n",
-        );
+            for hid in
+                state.hid_devices.iter_mut()
+            {
+                match hid.task.as_mut().poll(
+                    &mut context,
+                ) {
+                    Poll::Ready(()) => {
+                        // HID tasks are designed to run forever.
+                        //
+                        // Reaching Ready therefore means the
+                        // task unexpectedly stopped.
+                        crate::serial::write_str(
+                            "USB HID: input task stopped\n",
+                        );
+                    }
+
+                    Poll::Pending => {
+                        // Normal state.
+                        //
+                        // DO NOT log this. This function runs
+                        // continuously and Pending is expected
+                        // while waiting for the USB controller.
+                    }
+                }
+            }
+        }
+
+        // ====================================================
+        // Process xHCI events AGAIN
+        // ====================================================
+        //
+        // A HID task can submit a new transfer while being
+        // polled above. Process the event ring again so that
+        // completions generated during this polling cycle are
+        // consumed before leaving poll().
+
+        state.event_handler.handle_event();
 
         // ====================================================
         // Initial USB device scan
         // ====================================================
 
-        if !state.devices_scanned {
-            crate::serial::write_str(
-                "USB POLL: starting USB device probe...\n",
+        if state.devices_scanned {
+            return;
+        }
+
+        // ====================================================
+        // Probe USB devices
+        // ====================================================
+
+        let result =
+            block_on_usb(
+                state.host.probe_devices(),
+                &state.event_handler,
             );
 
-            crate::serial::write_str(
-                "USB POLL: calling host.probe_devices()...\n",
-            );
+        match result {
+            Ok(changes) => {
+                // ====================================================
+                // Connected devices
+                // ====================================================
 
-            let result =
-                block_on_usb(
-                    state.host.probe_devices(),
-                    &state.event_handler,
-                );
+                for (
+                    index,
+                    probed_device,
+                ) in changes.connected
+                    .into_iter()
+                    .enumerate()
+                {
+                    match probed_device {
+                        // ====================================================
+                        // Normal USB device
+                        // ====================================================
 
-            crate::serial::write_str(
-                "USB POLL: host.probe_devices() returned\n",
-            );
+                        ProbedDevice::Device(info) => {
+                            crate::serial::write_str(
+                                "USB: device connected #",
+                            );
 
-            match result {
-                Ok(changes) => {
-                    // ========================================
-                    // Probe succeeded
-                    // ========================================
+                            crate::serial::write_hex(
+                                index as u64,
+                            );
 
-                    crate::serial::write_str(
-                        "USB POLL: device probe succeeded\n",
-                    );
+                            crate::serial::write_str(
+                                " VID=",
+                            );
 
-                    crate::serial::write_str(
-                        "USB POLL: connected count=",
-                    );
+                            crate::serial::write_hex(
+                                info.vendor_id() as u64,
+                            );
 
-                    crate::serial::write_hex(
-                        changes.connected.len() as u64,
-                    );
+                            crate::serial::write_str(
+                                " PID=",
+                            );
 
-                    crate::serial::write_str(
-                        "\n",
-                    );
+                            crate::serial::write_hex(
+                                info.product_id() as u64,
+                            );
 
-                    crate::serial::write_str(
-                        "USB POLL: disconnected count=",
-                    );
+                            crate::serial::write_str(
+                                "\n",
+                            );
 
-                    crate::serial::write_hex(
-                        changes.disconnected.len() as u64,
-                    );
+                            // ====================================================
+                            // Inspect descriptors
+                            // ====================================================
 
-                    crate::serial::write_str(
-                        "\n",
-                    );
+                            devices::inspect_device_info(
+                                &info,
+                            );
 
-                    // ========================================
-                    // Process connected devices
-                    // ========================================
+                            // ====================================================
+                            // Open device
+                            // ====================================================
 
-                    for (
-                        index,
-                        probed_device,
-                    ) in changes
-                        .connected
-                        .into_iter()
-                        .enumerate()
-                    {
-                        match probed_device {
-                            // ====================================
-                            // Normal USB device
-                            // ====================================
-
-                            ProbedDevice::Device(info) => {
-                                crate::serial::write_str(
-                                    "USB POLL: connected device #",
+                            let open_result =
+                                block_on_usb(
+                                    state.host.open_device(
+                                        &info,
+                                    ),
+                                    &state.event_handler,
                                 );
 
-                                crate::serial::write_hex(
-                                    index as u64,
-                                );
-
-                                crate::serial::write_str(
-                                    "\n",
-                                );
-
-                                crate::serial::write_str(
-                                    "USB POLL: device discovered\n",
-                                );
-
-                                // --------------------------------
-                                // VID / PID
-                                // --------------------------------
-
-                                crate::serial::write_str(
-                                    "USB POLL: vendor_id=",
-                                );
-
-                                crate::serial::write_hex(
-                                    info.vendor_id() as u64,
-                                );
-
-                                crate::serial::write_str(
-                                    " product_id=",
-                                );
-
-                                crate::serial::write_hex(
-                                    info.product_id() as u64,
-                                );
-
-                                crate::serial::write_str(
-                                    "\n",
-                                );
-
-                                // ====================================
-                                // Inspect descriptors
-                                // ====================================
-
-                                crate::serial::write_str(
-                                    "USB POLL: inspecting USB interfaces...\n",
-                                );
-
-                                devices::inspect_device_info(
-                                    &info,
-                                );
-
-                                // ====================================
-                                // Open device
-                                // ====================================
-
-                                crate::serial::write_str(
-                                    "USB POLL: opening device #",
-                                );
-
-                                crate::serial::write_hex(
-                                    index as u64,
-                                );
-
-                                crate::serial::write_str(
-                                    "...\n",
-                                );
-
-                                let open_result =
-                                    block_on_usb(
-                                        state.host.open_device(
-                                            &info,
-                                        ),
-                                        &state.event_handler,
-                                    );
-
-                                crate::serial::write_str(
-                                    "USB POLL: open_device() returned\n",
-                                );
-
+                            // IMPORTANT:
+                            //
+                            // Device must remain mutable because
+                            // claim_interface() requires &mut self.
+                            //
+                            let mut device =
                                 match open_result {
-                                    Ok(mut device) => {
+                                    Ok(device) => {
+                                        device
+                                    }
+
+                                    Err(_) => {
                                         crate::serial::write_str(
-                                            "USB POLL: device opened successfully\n",
+                                            "USB: failed to open device\n",
                                         );
 
-                                        // ====================================================
-                                        // Inspect opened device
-                                        // ====================================================
+                                        continue;
+                                    }
+                                };
 
-                                        devices::inspect_open_device(
-                                            &device,
+                            // ====================================================
+                            // Inspect opened device
+                            // ====================================================
+
+                            devices::inspect_open_device(
+                                &device,
+                            );
+
+                            // ====================================================
+                            // Find HID interface
+                            // ====================================================
+
+                            let hid_interface =
+                                match devices::find_hid_interface(
+                                    &device,
+                                ) {
+                                    Some(interface) => {
+                                        interface
+                                    }
+
+                                    None => {
+                                        // Not an HID device.
+                                        //
+                                        // Keep the Device alive anyway.
+                                        state.devices.push(
+                                            device,
                                         );
 
-                                        // ====================================================
-                                        // Find supported HID interface
-                                        // ====================================================
+                                        continue;
+                                    }
+                                };
 
-                                        let hid_interface =
-                                            devices::find_hid_interface(
-                                                &device,
-                                            );
+                            // ====================================================
+                            // HID type
+                            // ====================================================
 
-                                        match hid_interface {
-                                            Some(interface) => {
-                                                // ============================================
-                                                // Report device type
-                                                // ============================================
+                            let kind =
+                                hid_interface.kind;
 
-                                                match interface.kind {
-                                                    devices::HidDeviceKind::Keyboard => {
-                                                        crate::serial::write_str(
-                                                            "USB POLL: opened device is a keyboard\n",
-                                                        );
-                                                    }
+                            match kind {
+                                devices::HidDeviceKind::Keyboard => {
+                                    crate::serial::write_str(
+                                        "USB: HID keyboard detected\n",
+                                    );
+                                }
 
-                                                    devices::HidDeviceKind::Mouse => {
-                                                        crate::serial::write_str(
-                                                            "USB POLL: opened device is a mouse\n",
-                                                        );
-                                                    }
-                                                }
+                                devices::HidDeviceKind::Mouse => {
+                                    crate::serial::write_str(
+                                        "USB: HID mouse detected\n",
+                                    );
+                                }
+                            }
 
-                                                // ============================================
-                                                // Find interrupt IN endpoint descriptor
-                                                // ============================================
+                            // ====================================================
+                            // Find interrupt IN endpoint
+                            // ====================================================
 
-                                                let endpoint =
-                                                    devices::find_hid_interrupt_in_endpoint(
-                                                        &device,
-                                                        interface.interface_number,
-                                                        interface.alternate_setting,
-                                                    );
+                            let endpoint =
+                                match devices::find_hid_interrupt_in_endpoint(
+                                    &device,
+                                    hid_interface.interface_number,
+                                    hid_interface.alternate_setting,
+                                ) {
+                                    Some(endpoint) => {
+                                        endpoint
+                                    }
 
-                                                match endpoint {
-                                                    Some(endpoint) => {
-                                                        crate::serial::write_str(
-                                                            "USB POLL: HID interrupt IN endpoint found\n",
-                                                        );
-
-                                                        crate::serial::write_str(
-                                                            "USB POLL: endpoint=",
-                                                        );
-
-                                                        crate::serial::write_hex(
-                                                            endpoint.address as u64,
-                                                        );
-
-                                                        crate::serial::write_str(
-                                                            " packet_size=",
-                                                        );
-
-                                                        crate::serial::write_hex(
-                                                            endpoint.max_packet_size as u64,
-                                                        );
-
-                                                        crate::serial::write_str(
-                                                            " interval=",
-                                                        );
-
-                                                        crate::serial::write_hex(
-                                                            endpoint.interval as u64,
-                                                        );
-
-                                                        crate::serial::write_str(
-                                                            "\n",
-                                                        );
-
-                                                        // ========================================
-                                                        // Claim HID interface
-                                                        // ========================================
-                                                        //
-                                                        // IMPORTANT:
-                                                        //
-                                                        // We do NOT call prepare_hid_device().
-                                                        //
-                                                        // That function no longer exists.
-                                                        //
-                                                        // CrabUSB 0.12.x returns the Interface from
-                                                        // claim_interface(). The Interface is what
-                                                        // owns the endpoint access.
-                                                        //
-                                                        // We therefore claim the interface here and
-                                                        // keep the Device alive in state.devices.
-                                                        //
-                                                        // ========================================
-
-                                                        crate::serial::write_str(
-                                                            "USB POLL: claiming HID interface=",
-                                                        );
-
-                                                        crate::serial::write_hex(
-                                                            interface.interface_number
-                                                                as u64,
-                                                        );
-
-                                                        crate::serial::write_str(
-                                                            " alt=",
-                                                        );
-
-                                                        crate::serial::write_hex(
-                                                            interface.alternate_setting
-                                                                as u64,
-                                                        );
-
-                                                        crate::serial::write_str(
-                                                            "\n",
-                                                        );
-
-                                                        let claim_result =
-                                                            block_on_usb(
-                                                                device.claim_interface(
-                                                                    interface.interface_number,
-                                                                    interface.alternate_setting,
-                                                                ),
-                                                                &state.event_handler,
-                                                            );
-
-                                                        match claim_result {
-                                                            Ok(_claimed_interface) => {
-                                                                crate::serial::write_str(
-                                                                    "USB POLL: HID interface claimed successfully\n",
-                                                                );
-
-                                                                crate::serial::write_str(
-                                                                    "USB POLL: HID device is ready for input transfers\n",
-                                                                );
-                                                            }
-
-                                                            Err(_) => {
-                                                                crate::serial::write_str(
-                                                                    "USB POLL: FAILED to claim HID interface\n",
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-
-                                                    None => {
-                                                        crate::serial::write_str(
-                                                            "USB POLL: HID interrupt IN endpoint not found\n",
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            None => {
-                                                crate::serial::write_str(
-                                                    "USB POLL: opened device has no supported HID interface\n",
-                                                );
-                                            }
-                                        }
-
-                                        // ====================================================
-                                        // Store opened device
-                                        // ====================================================
-
+                                    None => {
                                         crate::serial::write_str(
-                                            "USB POLL: storing opened device\n",
+                                            "USB: HID interrupt IN endpoint not found\n",
                                         );
 
                                         state.devices.push(
                                             device,
                                         );
 
-                                        crate::serial::write_str(
-                                            "USB POLL: device stored\n",
-                                        );
+                                        continue;
+                                    }
+                                };
+
+                            crate::serial::write_str(
+                                "USB: HID endpoint=",
+                            );
+
+                            crate::serial::write_hex(
+                                endpoint.address as u64,
+                            );
+
+                            crate::serial::write_str(
+                                " packet_size=",
+                            );
+
+                            crate::serial::write_hex(
+                                endpoint.max_packet_size as u64,
+                            );
+
+                            crate::serial::write_str(
+                                " interval=",
+                            );
+
+                            crate::serial::write_hex(
+                                endpoint.interval as u64,
+                            );
+
+                            crate::serial::write_str(
+                                "\n",
+                            );
+
+                            // ====================================================
+                            // Claim HID interface
+                            // ====================================================
+
+                            let interface =
+                                match block_on_usb(
+                                    device.claim_interface(
+                                        hid_interface.interface_number,
+                                        hid_interface.alternate_setting,
+                                    ),
+                                    &state.event_handler,
+                                ) {
+                                    Ok(interface) => {
+                                        interface
                                     }
 
                                     Err(_) => {
                                         crate::serial::write_str(
-                                            "USB POLL: FAILED to open device\n",
+                                            "USB: failed to claim HID interface\n",
                                         );
+
+                                        state.devices.push(
+                                            device,
+                                        );
+
+                                        continue;
                                     }
-                                }
-                            }
+                                };
 
-                            // ====================================
-                            // USB hub
-                            // ====================================
+                            // ====================================================
+                            // Save HID properties
+                            // ====================================================
 
-                            ProbedDevice::Hub(info) => {
-                                crate::serial::write_str(
-                                    "USB POLL: connected USB hub #",
+                            let endpoint_address =
+                                endpoint.address;
+
+                            let packet_size =
+                                endpoint.max_packet_size
+                                    as usize;
+
+                            // ====================================================
+                            // Create EndpointHandle
+                            // ====================================================
+
+                            let hid_endpoint =
+                                match interface.endpoint(
+                                    endpoint_address,
+                                ) {
+                                    Ok(endpoint) => {
+                                        endpoint
+                                    }
+
+                                    Err(_) => {
+                                        crate::serial::write_str(
+                                            "USB: failed to create HID endpoint handle\n",
+                                        );
+
+                                        state.devices.push(
+                                            device,
+                                        );
+
+                                        continue;
+                                    }
+                                };
+
+                            // ====================================================
+                            // Create persistent HID task
+                            // ====================================================
+
+                            let task:
+                                init::HidInputTask =
+                                Box::pin(
+                                    async move {
+                                        // ------------------------------------------------
+                                        // One-time task startup logging
+                                        // ------------------------------------------------
+
+                                        match kind {
+                                            devices::HidDeviceKind::Keyboard => {
+                                                crate::serial::write_str(
+                                                    "USB HID: keyboard task started\n",
+                                                );
+                                            }
+
+                                            devices::HidDeviceKind::Mouse => {
+                                                crate::serial::write_str(
+                                                    "USB HID: mouse task started\n",
+                                                );
+                                            }
+                                        }
+
+                                        // ------------------------------------------------
+                                        // Persistent HID report buffer
+                                        // ------------------------------------------------
+
+                                        let mut report =
+                                            Vec::<u8>::with_capacity(
+                                                packet_size,
+                                            );
+
+                                        report.resize(
+                                            packet_size,
+                                            0u8,
+                                        );
+
+                                        // ------------------------------------------------
+                                        // Persistent interrupt-IN loop
+                                        // ------------------------------------------------
+
+                                        loop {
+                                            let request =
+                                                TransferRequest::interrupt_in(
+                                                    &mut report,
+                                                );
+
+                                            let result =
+                                                hid_endpoint
+                                                    .wait(
+                                                        request,
+                                                    )
+                                                    .await;
+
+                                            match result {
+                                                Ok(completion) => {
+                                                    let actual_length =
+                                                        core::cmp::min(
+                                                            completion.actual_length,
+                                                            report.len(),
+                                                        );
+
+                                                    // ------------------------------------------------
+                                                    // Transfer completed
+                                                    // ------------------------------------------------
+
+                                                    crate::serial::write_str(
+                                                        "USB HID: transfer completed length=",
+                                                    );
+
+                                                    crate::serial::write_hex(
+                                                        actual_length as u64,
+                                                    );
+
+                                                    crate::serial::write_str(
+                                                        "\n",
+                                                    );
+
+                                                    // ------------------------------------------------
+                                                    // Parse report
+                                                    // ------------------------------------------------
+
+                                                    let report_slice =
+                                                        &report[
+                                                            ..actual_length
+                                                            ];
+
+                                                    match kind {
+                                                        devices::HidDeviceKind::Keyboard => {
+                                                            crate::input::process_keyboard_report(
+                                                                report_slice,
+                                                            );
+                                                        }
+
+                                                        devices::HidDeviceKind::Mouse => {
+                                                            crate::input::process_mouse_report(
+                                                                report_slice,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
+                                                Err(_) => {
+                                                    // ------------------------------------------------
+                                                    // Transfer error
+                                                    // ------------------------------------------------
+                                                    //
+                                                    // Do not spam this either.
+                                                    // A future revision can add
+                                                    // rate limiting if required.
+
+                                                    crate::serial::write_str(
+                                                        "USB HID: interrupt transfer error\n",
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    },
                                 );
 
-                                crate::serial::write_hex(
-                                    index as u64,
-                                );
+                            // ====================================================
+                            // Store HID task
+                            // ====================================================
 
-                                crate::serial::write_str(
-                                    "\n",
-                                );
+                            state.hid_devices.push(
+                                init::HidInputDevice {
+                                    kind,
+                                    endpoint_address,
+                                    packet_size,
+                                    task,
+                                },
+                            );
 
-                                crate::serial::write_str(
-                                    "USB POLL: hub vendor_id=",
-                                );
+                            // ====================================================
+                            // Keep opened Device alive
+                            // ====================================================
 
-                                crate::serial::write_hex(
-                                    info.vendor_id() as u64,
-                                );
+                            state.devices.push(
+                                device,
+                            );
 
-                                crate::serial::write_str(
-                                    " product_id=",
-                                );
+                            crate::serial::write_str(
+                                "USB: HID device initialized\n",
+                            );
+                        }
 
-                                crate::serial::write_hex(
-                                    info.product_id() as u64,
-                                );
+                        // ====================================================
+                        // USB hub
+                        // ====================================================
 
-                                crate::serial::write_str(
-                                    "\n",
-                                );
+                        ProbedDevice::Hub(info) => {
+                            crate::serial::write_str(
+                                "USB: hub connected VID=",
+                            );
 
-                                crate::serial::write_str(
-                                    "USB POLL: hub opening is not handled yet\n",
-                                );
-                            }
+                            crate::serial::write_hex(
+                                info.vendor_id() as u64,
+                            );
+
+                            crate::serial::write_str(
+                                " PID=",
+                            );
+
+                            crate::serial::write_hex(
+                                info.product_id() as u64,
+                            );
+
+                            crate::serial::write_str(
+                                "\n",
+                            );
+
+                            // Hub support is not implemented yet.
                         }
                     }
+                }
 
-                    // ========================================
-                    // Report disconnected devices
-                    // ========================================
+                // ====================================================
+                // Disconnected devices
+                // ====================================================
 
-                    for device_id
-                    in changes.disconnected
-                    {
-                        crate::serial::write_str(
-                            "USB POLL: disconnected device id=",
-                        );
-
-                        crate::serial::write_hex(
-                            device_id as u64,
-                        );
-
-                        crate::serial::write_str(
-                            "\n",
-                        );
-                    }
-
-                    // ========================================
-                    // Device count
-                    // ========================================
-
+                for device_id in
+                    changes.disconnected
+                {
                     crate::serial::write_str(
-                        "USB POLL: stored device count=",
+                        "USB: device disconnected id=",
                     );
 
                     crate::serial::write_hex(
-                        state.devices.len() as u64,
+                        device_id as u64,
                     );
 
                     crate::serial::write_str(
                         "\n",
                     );
-
-                    // ========================================
-                    // Initial scan complete
-                    // ========================================
-
-                    state.devices_scanned =
-                        true;
-
-                    crate::serial::write_str(
-                        "USB POLL: initial device scan complete\n",
-                    );
                 }
 
-                Err(_) => {
-                    crate::serial::write_str(
-                        "USB POLL: device probe FAILED\n",
-                    );
-                }
+                // ====================================================
+                // Mark initial scan complete
+                // ====================================================
+
+                state.devices_scanned =
+                    true;
+
+                crate::serial::write_str(
+                    "USB: initial device scan complete\n",
+                );
             }
-        } else {
-            // ====================================================
-            // Subsequent polls
-            // ====================================================
 
-            crate::serial::write_str(
-                "USB POLL: initial device scan already completed\n",
-            );
-
-            crate::serial::write_str(
-                "USB POLL: currently stored devices=",
-            );
-
-            crate::serial::write_hex(
-                state.devices.len() as u64,
-            );
-
-            crate::serial::write_str(
-                "\n",
-            );
+            Err(_) => {
+                crate::serial::write_str(
+                    "USB: device probe failed\n",
+                );
+            }
         }
     }
-
-    crate::serial::write_str(
-        "USB POLL: leaving\n",
-    );
 }
 
 // ============================================================
-// Small synchronous executor for CrabUSB futures
+// Synchronous USB future executor
 // ============================================================
 //
-// Rusty does not currently have a general async executor.
+// Used for short-lived CrabUSB operations such as:
 //
-// While a CrabUSB future is pending:
+//   - probe_devices()
+//   - open_device()
+//   - claim_interface()
+//   - controller initialization
 //
-// 1. poll the future
-// 2. process xHCI events
-// 3. poll again
+// This is NOT used for persistent HID transfers.
+//
+// Persistent HID transfers are manually polled from poll().
 //
 // ============================================================
 
@@ -590,33 +667,17 @@ pub(crate) fn block_on_usb<F>(
 where
     F: Future,
 {
-    crate::serial::write_str(
-        "USB FUTURE: starting\n",
-    );
-
     let waker =
         noop_waker();
-
-    crate::serial::write_str(
-        "USB FUTURE: waker created\n",
-    );
 
     let mut context =
         Context::from_waker(
             &waker,
         );
 
-    crate::serial::write_str(
-        "USB FUTURE: context created\n",
-    );
-
     let mut future =
         future;
 
-    // SAFETY:
-    //
-    // The future remains at this exact memory location until
-    // Poll::Ready is returned.
     let mut future =
         unsafe {
             Pin::new_unchecked(
@@ -624,55 +685,19 @@ where
             )
         };
 
-    crate::serial::write_str(
-        "USB FUTURE: future pinned\n",
-    );
-
-    let mut poll_count:
-        u64 = 0;
-
     loop {
-        poll_count += 1;
-
-        crate::serial::write_str(
-            "USB FUTURE: poll #",
-        );
-
-        crate::serial::write_hex(
-            poll_count,
-        );
-
-        crate::serial::write_str(
-            "\n",
-        );
-
         match Future::poll(
             future.as_mut(),
             &mut context,
         ) {
             Poll::Ready(value) => {
-                crate::serial::write_str(
-                    "USB FUTURE: READY\n",
-                );
-
                 return value;
             }
 
             Poll::Pending => {
-                crate::serial::write_str(
-                    "USB FUTURE: PENDING\n",
-                );
-
-                crate::serial::write_str(
-                    "USB FUTURE: processing xHCI events\n",
-                );
-
-                event_handler
-                    .handle_event();
-
-                crate::serial::write_str(
-                    "USB FUTURE: xHCI events processed\n",
-                );
+                // Process xHCI events while waiting
+                // for the synchronous operation.
+                event_handler.handle_event();
 
                 core::hint::spin_loop();
             }
@@ -682,6 +707,13 @@ where
 
 // ============================================================
 // No-op waker
+// ============================================================
+//
+// Rusty's kernel currently manually polls USB futures, so a
+// scheduler-backed waker isn't required yet.
+//
+// The xHCI event handler is explicitly driven by poll().
+//
 // ============================================================
 
 fn noop_waker() -> Waker {
@@ -723,7 +755,7 @@ fn noop_waker() -> Waker {
             RawWaker::new(
                 ptr::null(),
                 &VTABLE,
-            ),
+            )
         )
     }
 }

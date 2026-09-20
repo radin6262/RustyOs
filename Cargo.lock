@@ -435,7 +435,7 @@ dependencies = [
  "thiserror",
  "ttf-parser",
  "x86_64 0.15.5",
- "xhci-nostd",
+ "xhci",
 ]
 
 [[package]]
@@ -946,13 +946,6 @@ dependencies = [
  "num-derive",
  "num-traits",
  "paste",
-]
-
-[[package]]
-name = "xhci-nostd"
-version = "0.1.0"
-dependencies = [
- "log",
 ]
 
 [[package]]

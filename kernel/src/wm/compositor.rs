@@ -9,8 +9,7 @@ use spin::Mutex;
 
 use super::window::Window;
 
-pub static WM:
-Mutex<Option<Compositor>> =
+pub static WM: Mutex<Option<Compositor>> =
     Mutex::new(None);
 
 // ============================================================
@@ -31,21 +30,27 @@ const CURSOR_COLOR: u32 =
 const CURSOR_RESTORE_PADDING: i64 = 1;
 
 // ============================================================
+// Mouse button bit flags
+// ============================================================
+
+const MOUSE_BUTTON_LEFT: u8 = 1 << 0;
+const MOUSE_BUTTON_RIGHT: u8 = 1 << 1;
+const MOUSE_BUTTON_MIDDLE: u8 = 1 << 2;
+const MOUSE_BUTTON_4: u8 = 1 << 3;
+const MOUSE_BUTTON_5: u8 = 1 << 4;
+
+// ============================================================
 // Compositor
 // ============================================================
 
 pub struct Compositor {
-    pub windows:
-        BTreeMap<u64, Window>,
+    pub windows: BTreeMap<u64, Window>,
 
-    pub screen_width:
-        usize,
+    pub screen_width: usize,
 
-    pub screen_height:
-        usize,
+    pub screen_height: usize,
 
-    pub hardware_framebuffer:
-        &'static mut [u32],
+    pub hardware_framebuffer: &'static mut [u32],
 
     // --------------------------------------------------------
     // Click detection state
@@ -53,16 +58,13 @@ pub struct Compositor {
 
     /// Whether a real hardware left click has been detected
     /// and is waiting to be consumed by sys_click().
-    click_pending:
-        bool,
+    click_pending: bool,
 
     /// Screen X coordinate of the detected click.
-    click_x:
-        i32,
+    click_x: i32,
 
     /// Screen Y coordinate of the detected click.
-    click_y:
-        i32,
+    click_y: i32,
 
     /// Whether the left mouse button is currently held.
     ///
@@ -71,18 +73,15 @@ pub struct Compositor {
     ///     press -> held -> release
     ///
     /// as one real click.
-    left_button_down:
-        bool,
+    left_button_down: bool,
 
     /// Screen position where the current left-button press
     /// started.
-    click_start_x:
-        i32,
+    click_start_x: i32,
 
     /// Screen position where the current left-button press
     /// started.
-    click_start_y:
-        i32,
+    click_start_y: i32,
 
     // --------------------------------------------------------
     // Clean composited screen
@@ -92,45 +91,36 @@ pub struct Compositor {
     ///
     /// IMPORTANT:
     /// The mouse cursor is NEVER stored in this buffer.
-    pub backbuffer:
-        Vec<u32>,
+    pub backbuffer: Vec<u32>,
 
     // --------------------------------------------------------
     // Mouse cursor state
     // --------------------------------------------------------
 
     /// Current cursor X position.
-    pub mouse_x:
-        i32,
+    pub mouse_x: i32,
 
     /// Current cursor Y position.
-    pub mouse_y:
-        i32,
+    pub mouse_y: i32,
 
     /// Current mouse button bitmap.
-    pub mouse_buttons:
-        u8,
+    pub mouse_buttons: u8,
 
     /// X position where the cursor was last drawn directly
     /// into the hardware framebuffer.
-    cursor_drawn_x:
-        i32,
+    cursor_drawn_x: i32,
 
     /// Y position where the cursor was last drawn directly
     /// into the hardware framebuffer.
-    cursor_drawn_y:
-        i32,
+    cursor_drawn_y: i32,
 
     /// Whether a cursor currently exists in the hardware
     /// framebuffer.
-    cursor_visible:
-        bool,
+    cursor_visible: bool,
 
-    next_window_id:
-        u64,
+    next_window_id: u64,
 
-    next_z_index:
-        usize,
+    next_z_index: usize,
 }
 
 impl Compositor {
@@ -143,25 +133,21 @@ impl Compositor {
         height: usize,
         fb_ptr: *mut u32,
     ) {
-        let size =
-            width
-                .checked_mul(height)
-                .expect(
-                    "Rusty: framebuffer size overflow",
-                );
+        let size = width
+            .checked_mul(height)
+            .expect(
+                "Rusty: framebuffer size overflow",
+            );
 
-        let hw_fb =
-            unsafe {
-                core::slice::from_raw_parts_mut(
-                    fb_ptr,
-                    size,
-                )
-            };
+        let hw_fb = unsafe {
+            core::slice::from_raw_parts_mut(
+                fb_ptr,
+                size,
+            )
+        };
 
         let mut backbuffer =
-            Vec::with_capacity(
-                size,
-            );
+            Vec::with_capacity(size);
 
         backbuffer.resize(
             size,
@@ -174,75 +160,56 @@ impl Compositor {
         let initial_mouse_y =
             (height / 2) as i32;
 
-        *WM.lock() =
-            Some(
-                Compositor {
-                    windows:
-                    BTreeMap::new(),
+        *WM.lock() = Some(
+            Compositor {
+                windows: BTreeMap::new(),
 
-                    screen_width:
-                    width,
+                screen_width: width,
 
-                    screen_height:
-                    height,
+                screen_height: height,
 
-                    hardware_framebuffer:
-                    hw_fb,
+                hardware_framebuffer: hw_fb,
 
-                    // ------------------------------------------------
-                    // Click detection starts completely idle.
-                    // ------------------------------------------------
+                // ------------------------------------------------
+                // Click detection starts completely idle.
+                // ------------------------------------------------
 
-                    click_pending:
-                    false,
+                click_pending: false,
 
-                    click_x:
-                    0,
+                click_x: 0,
 
-                    click_y:
-                    0,
+                click_y: 0,
 
-                    left_button_down:
-                    false,
+                left_button_down: false,
 
-                    click_start_x:
-                    initial_mouse_x,
+                click_start_x: initial_mouse_x,
 
-                    click_start_y:
-                    initial_mouse_y,
+                click_start_y: initial_mouse_y,
 
-                    // ------------------------------------------------
-                    // Cursor is intentionally NOT included
-                    // in the backbuffer.
-                    // ------------------------------------------------
+                // ------------------------------------------------
+                // Cursor is intentionally NOT included
+                // in the backbuffer.
+                // ------------------------------------------------
 
-                    backbuffer,
+                backbuffer,
 
-                    mouse_x:
-                    initial_mouse_x,
+                mouse_x: initial_mouse_x,
 
-                    mouse_y:
-                    initial_mouse_y,
+                mouse_y: initial_mouse_y,
 
-                    mouse_buttons:
-                    0,
+                mouse_buttons: 0,
 
-                    cursor_drawn_x:
-                    initial_mouse_x,
+                cursor_drawn_x: initial_mouse_x,
 
-                    cursor_drawn_y:
-                    initial_mouse_y,
+                cursor_drawn_y: initial_mouse_y,
 
-                    cursor_visible:
-                    false,
+                cursor_visible: false,
 
-                    next_window_id:
-                    1,
+                next_window_id: 1,
 
-                    next_z_index:
-                    1,
-                },
-            );
+                next_z_index: 1,
+            },
+        );
     }
 
     // ========================================================
@@ -256,33 +223,26 @@ impl Compositor {
         width: usize,
         height: usize,
     ) -> u64 {
-        let id =
-            self.next_window_id;
+        let id = self.next_window_id;
 
         self.next_window_id =
             self.next_window_id
-                .saturating_add(
-                    1,
-                );
+                .saturating_add(1);
 
-        let z =
-            self.next_z_index;
+        let z = self.next_z_index;
 
         self.next_z_index =
             self.next_z_index
-                .saturating_add(
-                    1,
-                );
+                .saturating_add(1);
 
-        let window =
-            Window::new(
-                id,
-                x,
-                y,
-                width,
-                height,
-                z,
-            );
+        let window = Window::new(
+            id,
+            x,
+            y,
+            width,
+            height,
+            z,
+        );
 
         self.windows.insert(
             id,
@@ -305,9 +265,7 @@ impl Compositor {
         id: u64,
     ) -> bool {
         self.windows
-            .remove(
-                &id,
-            )
+            .remove(&id)
             .is_some()
     }
 
@@ -321,9 +279,7 @@ impl Compositor {
         user_buffer: &[u32],
     ) -> bool {
         if let Some(win) =
-            self.windows.get_mut(
-                &id,
-            )
+            self.windows.get_mut(&id)
         {
             if user_buffer.len()
                 != win.pixels.len()
@@ -343,121 +299,195 @@ impl Compositor {
     }
 
     // ========================================================
-    // Mouse
+    // Mouse / Input
     // ========================================================
 
-    /// Poll all currently available mouse events and update
+    /// Poll all currently available input events and update
     /// the compositor cursor position and physical button state.
     ///
-    /// A click is generated ONLY from real hardware input:
+    /// Mouse movement comes from:
+    ///
+    ///     InputEvent::MouseMove
+    ///
+    /// Mouse buttons come from:
+    ///
+    ///     InputEvent::MouseButtonDown
+    ///     InputEvent::MouseButtonUp
+    ///
+    /// Keyboard and mouse-wheel events are ignored here because
+    /// they belong to higher-level input consumers.
+    ///
+    /// A click is generated ONLY from a real hardware:
     ///
     ///     left button press
     ///             +
     ///     left button release
     ///
-    /// No mouse input is generated or simulated by this code.
-    ///
-    /// Returns true when at least one mouse event was received.
+    /// Returns true when at least one input event was received.
     pub fn update_mouse(
         &mut self,
     ) -> bool {
-        let mut changed =
-            false;
+        let mut changed = false;
 
-        // Drain multiple reports so the cursor catches up
+        // Drain multiple events so the cursor catches up
         // if several reports arrived between compositor ticks.
         for _ in 0..32 {
             let Some(event) =
-                crate::input::poll_mouse()
+                crate::input::poll_mouse_event()
             else {
                 break;
             };
 
-            // ------------------------------------------------
-            // Previous left-button state.
-            // ------------------------------------------------
-
-            let previous_left =
-                self.left_button_down;
-
-            // ------------------------------------------------
-            // Current left-button state from the REAL
-            // hardware HID report.
-            // ------------------------------------------------
-
-            let current_left =
-                event.buttons
-                    & crate::input::MouseEvent::LEFT_BUTTON
-                    != 0;
-
-            // ------------------------------------------------
-            // Update cursor position first.
-            // ------------------------------------------------
-
-            self.mouse_x =
-                self.mouse_x
-                    .saturating_add(
-                        event.dx as i32,
-                    );
-
-            self.mouse_y =
-                self.mouse_y
-                    .saturating_add(
-                        event.dy as i32,
-                    );
-
-            self.mouse_buttons =
-                event.buttons;
-
-            self.clamp_mouse();
-
-            // ------------------------------------------------
-            // Detect physical left-button press.
-            // ------------------------------------------------
-
-            if current_left
-                && !previous_left
-            {
-                self.left_button_down =
-                    true;
-
-                self.click_start_x =
-                    self.mouse_x;
-
-                self.click_start_y =
-                    self.mouse_y;
-            }
-
-            // ------------------------------------------------
-            // Detect physical left-button release.
-            // ------------------------------------------------
-
-            if !current_left
-                && previous_left
-            {
-                self.left_button_down =
-                    false;
-
+            match event {
                 // ------------------------------------------------
-                // The click belongs to where the button was
-                // physically pressed.
+                // Mouse movement
                 // ------------------------------------------------
 
-                self.click_x =
-                    self.click_start_x;
+                crate::input::InputEvent::MouseMove {
+                    x,
+                    y,
+                } => {
+                    self.mouse_x =
+                        self.mouse_x
+                            .saturating_add(
+                                x as i32,
+                            );
 
-                self.click_y =
-                    self.click_start_y;
+                    self.mouse_y =
+                        self.mouse_y
+                            .saturating_add(
+                                y as i32,
+                            );
 
-                self.click_pending =
-                    true;
+                    self.clamp_mouse();
+
+                    changed = true;
+                }
+
+                // ------------------------------------------------
+                // Mouse button press
+                // ------------------------------------------------
+
+                crate::input::InputEvent::MouseButtonDown(
+                    button,
+                ) => {
+                    let mask =
+                        Self::mouse_button_mask(
+                            button,
+                        );
+
+                    self.mouse_buttons |= mask;
+
+                    if matches!(
+                        button,
+                        crate::input::MouseButton::Left
+                    ) {
+                        self.left_button_down =
+                            true;
+
+                        self.click_start_x =
+                            self.mouse_x;
+
+                        self.click_start_y =
+                            self.mouse_y;
+                    }
+
+                    changed = true;
+                }
+
+                // ------------------------------------------------
+                // Mouse button release
+                // ------------------------------------------------
+
+                crate::input::InputEvent::MouseButtonUp(
+                    button,
+                ) => {
+                    let mask =
+                        Self::mouse_button_mask(
+                            button,
+                        );
+
+                    self.mouse_buttons &=
+                        !mask;
+
+                    if matches!(
+                        button,
+                        crate::input::MouseButton::Left
+                    ) {
+                        if self.left_button_down {
+                            self.left_button_down =
+                                false;
+
+                            // The click belongs to where the
+                            // physical button was pressed.
+                            self.click_x =
+                                self.click_start_x;
+
+                            self.click_y =
+                                self.click_start_y;
+
+                            self.click_pending =
+                                true;
+                        }
+                    }
+
+                    changed = true;
+                }
+
+                // ------------------------------------------------
+                // Mouse wheel
+                // ------------------------------------------------
+
+                crate::input::InputEvent::MouseWheel {
+                    ..
+                } => {
+                    // The compositor does not currently use
+                    // mouse-wheel events.
+                    changed = true;
+                }
+
+                // ------------------------------------------------
+                // Keyboard
+                // ------------------------------------------------
+
+                crate::input::InputEvent::KeyDown {
+                    ..
+                }
+                | crate::input::InputEvent::KeyUp {
+                    ..
+                } => {
+                    // Keyboard input is handled by higher-level
+                    // input consumers/syscalls.
+                }
             }
-
-            changed =
-                true;
         }
 
         changed
+    }
+
+    // ========================================================
+    // Mouse button conversion
+    // ========================================================
+
+    fn mouse_button_mask(
+        button: crate::input::MouseButton,
+    ) -> u8 {
+        match button {
+            crate::input::MouseButton::Left =>
+                MOUSE_BUTTON_LEFT,
+
+            crate::input::MouseButton::Right =>
+                MOUSE_BUTTON_RIGHT,
+
+            crate::input::MouseButton::Middle =>
+                MOUSE_BUTTON_MIDDLE,
+
+            crate::input::MouseButton::Button4 =>
+                MOUSE_BUTTON_4,
+
+            crate::input::MouseButton::Button5 =>
+                MOUSE_BUTTON_5,
+        }
     }
 
     // ========================================================
@@ -476,33 +506,19 @@ impl Compositor {
     ///
     /// It only consumes a click event that was already received
     /// from the physical mouse.
-    ///
-    /// Returns:
-    ///
-    ///     true  -> a real click was detected at (x, y)
-    ///     false -> no matching click is pending
     pub fn sys_click(
         &mut self,
         x: usize,
         y: usize,
     ) -> bool {
-        // ----------------------------------------------------
-        // No click waiting.
-        // ----------------------------------------------------
-
         if !self.click_pending {
             return false;
         }
 
-        // ----------------------------------------------------
-        // Reject invalid/negative coordinates.
-        // ----------------------------------------------------
-
         if self.click_x < 0
             || self.click_y < 0
         {
-            self.click_pending =
-                false;
+            self.click_pending = false;
 
             return false;
         }
@@ -513,22 +529,13 @@ impl Compositor {
         let click_y =
             self.click_y as usize;
 
-        // ----------------------------------------------------
-        // Exact coordinate match.
-        // ----------------------------------------------------
-
         if click_x != x
             || click_y != y
         {
             return false;
         }
 
-        // ----------------------------------------------------
-        // Consume the click.
-        // ----------------------------------------------------
-
-        self.click_pending =
-            false;
+        self.click_pending = false;
 
         true
     }
@@ -544,9 +551,6 @@ impl Compositor {
     ///
     ///     x <= click_x < x + width
     ///     y <= click_y < y + height
-    ///
-    /// The click is consumed only when it falls inside the
-    /// requested rectangle.
     pub fn sys_click_rect(
         &mut self,
         x: usize,
@@ -554,23 +558,14 @@ impl Compositor {
         width: usize,
         height: usize,
     ) -> bool {
-        // ----------------------------------------------------
-        // No click waiting.
-        // ----------------------------------------------------
-
         if !self.click_pending {
             return false;
         }
 
-        // ----------------------------------------------------
-        // Reject invalid/negative coordinates.
-        // ----------------------------------------------------
-
         if self.click_x < 0
             || self.click_y < 0
         {
-            self.click_pending =
-                false;
+            self.click_pending = false;
 
             return false;
         }
@@ -581,45 +576,23 @@ impl Compositor {
         let click_y =
             self.click_y as usize;
 
-        // ----------------------------------------------------
-        // Empty rectangles cannot contain a click.
-        // ----------------------------------------------------
-
         if width == 0
             || height == 0
         {
             return false;
         }
 
-        // ----------------------------------------------------
-        // Checked bounds prevent integer overflow.
-        // ----------------------------------------------------
-
         let right =
-            match x.checked_add(
-                width,
-            ) {
-                Some(value) =>
-                    value,
-
-                None =>
-                    return false,
+            match x.checked_add(width) {
+                Some(value) => value,
+                None => return false,
             };
 
         let bottom =
-            match y.checked_add(
-                height,
-            ) {
-                Some(value) =>
-                    value,
-
-                None =>
-                    return false,
+            match y.checked_add(height) {
+                Some(value) => value,
+                None => return false,
             };
-
-        // ----------------------------------------------------
-        // Hit test.
-        // ----------------------------------------------------
 
         let inside =
             click_x >= x
@@ -631,12 +604,7 @@ impl Compositor {
             return false;
         }
 
-        // ----------------------------------------------------
-        // Consume the click.
-        // ----------------------------------------------------
-
-        self.click_pending =
-            false;
+        self.click_pending = false;
 
         true
     }
@@ -654,8 +622,7 @@ impl Compositor {
         &mut self,
     ) {
         // ----------------------------------------------------
-        // If the cursor was already drawn, restore the small
-        // area underneath it from the clean backbuffer.
+        // Restore the area underneath the previous cursor.
         // ----------------------------------------------------
 
         if self.cursor_visible {
@@ -677,18 +644,13 @@ impl Compositor {
             self.mouse_y,
         );
 
-        // ----------------------------------------------------
-        // Remember its current location.
-        // ----------------------------------------------------
-
         self.cursor_drawn_x =
             self.mouse_x;
 
         self.cursor_drawn_y =
             self.mouse_y;
 
-        self.cursor_visible =
-            true;
+        self.cursor_visible = true;
     }
 
     // ========================================================
@@ -748,19 +710,14 @@ impl Compositor {
             return;
         }
 
-        for y in
-            start_y..=end_y
-        {
+        for y in start_y..=end_y {
             let row =
                 y as usize
                     * self.screen_width;
 
-            for x in
-                start_x..=end_x
-            {
+            for x in start_x..=end_x {
                 let index =
-                    row
-                        + x as usize;
+                    row + x as usize;
 
                 self.hardware_framebuffer[
                     index
@@ -799,7 +756,7 @@ impl Compositor {
         &self,
     ) -> bool {
         self.mouse_buttons
-            & crate::input::MouseEvent::LEFT_BUTTON
+            & MOUSE_BUTTON_LEFT
             != 0
     }
 
@@ -807,7 +764,7 @@ impl Compositor {
         &self,
     ) -> bool {
         self.mouse_buttons
-            & crate::input::MouseEvent::RIGHT_BUTTON
+            & MOUSE_BUTTON_RIGHT
             != 0
     }
 
@@ -815,7 +772,7 @@ impl Compositor {
         &self,
     ) -> bool {
         self.mouse_buttons
-            & crate::input::MouseEvent::MIDDLE_BUTTON
+            & MOUSE_BUTTON_MIDDLE
             != 0
     }
 
@@ -829,11 +786,8 @@ impl Compositor {
         if self.screen_width == 0
             || self.screen_height == 0
         {
-            self.mouse_x =
-                0;
-
-            self.mouse_y =
-                0;
+            self.mouse_x = 0;
+            self.mouse_y = 0;
 
             return;
         }
@@ -849,18 +803,16 @@ impl Compositor {
                 as i32;
 
         self.mouse_x =
-            self.mouse_x
-                .clamp(
-                    0,
-                    max_x,
-                );
+            self.mouse_x.clamp(
+                0,
+                max_x,
+            );
 
         self.mouse_y =
-            self.mouse_y
-                .clamp(
-                    0,
-                    max_y,
-                );
+            self.mouse_y.clamp(
+                0,
+                max_y,
+            );
     }
 
     // ========================================================
@@ -880,13 +832,10 @@ impl Compositor {
         // 1. Render desktop background
         // ====================================================
 
-        for y in
-            0..screen_height
-        {
+        for y in 0..screen_height {
             let ratio =
                 (y * 255)
-                    / screen_height
-                    .max(1);
+                    / screen_height.max(1);
 
             let r =
                 (15 + ratio / 15)
@@ -911,12 +860,9 @@ impl Compositor {
 
             self.backbuffer[
                 row_start
-                    ..row_start
-                    + screen_width
+                    ..row_start + screen_width
                 ]
-                .fill(
-                    bg_color,
-                );
+                .fill(bg_color);
         }
 
         // ====================================================
@@ -929,10 +875,9 @@ impl Compositor {
                 .values()
                 .collect();
 
-        sorted_windows
-            .sort_by_key(
-                |w| w.z_index,
-            );
+        sorted_windows.sort_by_key(
+            |w| w.z_index,
+        );
 
         // ====================================================
         // 3. Composite windows
@@ -941,9 +886,7 @@ impl Compositor {
         let backbuffer =
             &mut self.backbuffer;
 
-        for win in
-            sorted_windows
-        {
+        for win in sorted_windows {
             let start_x =
                 core::cmp::max(
                     0,
@@ -973,16 +916,14 @@ impl Compositor {
                     screen_width as i64,
                     end_x_i64,
                 )
-                    .max(0)
-                    as usize;
+                    .max(0) as usize;
 
             let end_y =
                 core::cmp::min(
                     screen_height as i64,
                     end_y_i64,
                 )
-                    .max(0)
-                    as usize;
+                    .max(0) as usize;
 
             if start_x >= end_x
                 || start_y >= end_y
@@ -990,12 +931,8 @@ impl Compositor {
                 continue;
             }
 
-            for py in
-                start_y..end_y
-            {
-                for px in
-                    start_x..end_x
-                {
+            for py in start_y..end_y {
+                for px in start_x..end_x {
                     let win_x =
                         (
                             px as i64
@@ -1008,10 +945,8 @@ impl Compositor {
                                 - win.y as i64
                         ) as usize;
 
-                    if win_x
-                        >= win.width
-                        || win_y
-                        >= win.height
+                    if win_x >= win.width
+                        || win_y >= win.height
                     {
                         continue;
                     }
@@ -1038,8 +973,7 @@ impl Compositor {
                     if alpha == 255 {
                         backbuffer[
                             screen_idx
-                            ] =
-                            pixel;
+                            ] = pixel;
                     } else if alpha > 0 {
                         let dst =
                             backbuffer[
@@ -1061,8 +995,7 @@ impl Compositor {
                                 & 0xFF;
 
                         let sb =
-                            pixel
-                                & 0xFF;
+                            pixel & 0xFF;
 
                         let dr =
                             (dst >> 16)
@@ -1146,8 +1079,7 @@ impl Compositor {
         self.cursor_drawn_y =
             self.mouse_y;
 
-        self.cursor_visible =
-            true;
+        self.cursor_visible = true;
     }
 
     // ========================================================
@@ -1162,29 +1094,12 @@ impl Compositor {
         y: i32,
     ) {
         const ROW_WIDTHS: &[usize] = &[
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
-            9,
-            7,
-            5,
-            3,
-            2,
+            1, 2, 3, 4, 5, 6, 7, 8,
+            9, 10, 11, 9, 7, 5, 3, 2,
         ];
 
-        let x =
-            x as i64;
-
-        let y =
-            y as i64;
+        let x = x as i64;
+        let y = y as i64;
 
         for (row, width)
         in ROW_WIDTHS.iter().enumerate()
@@ -1241,10 +1156,8 @@ impl Compositor {
                 )
                 .saturating_sub(1);
 
-        if end_x
-            < start_x as i64
-            || end_y
-            < start_y as i64
+        if end_x < start_x as i64
+            || end_y < start_y as i64
         {
             return;
         }
@@ -1314,10 +1227,9 @@ impl Compositor {
             let idx =
                 (y as usize)
                     * screen_width
-                    + (x as usize);
+                    + x as usize;
 
-            framebuffer[idx] =
-                color;
+            framebuffer[idx] = color;
         }
     }
 }

@@ -24,7 +24,7 @@ use crate::memory;
 // Configuration
 // ============================================================
 
-const DEBUG_DMA: bool = true;
+const DEBUG_DMA: bool = false;
 
 // ============================================================
 // Static DMA backend
