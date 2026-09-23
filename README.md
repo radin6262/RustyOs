@@ -4,10 +4,11 @@ RustyOS is a lightweight hobby operating system written in Rust.
 
 a simple modern uefi hobby operating system
 
-## Version Logs
-Version logs will contain changlogs and deprecation notices. [Click Me](versionlogs.md) to go version logs
+> This Project is discontinued. i honestly rage quit because i absouletely could not make the xhci driver work
+<!--## Version Logs
+Version logs will contain changlogs and deprecation notices. [Click Me](versionlogs.md) to go version logs-->
 
-## Features
+<!--## Features
 
 - UEFI boot
 - x86_64 kernel
@@ -24,7 +25,7 @@ Version logs will contain changlogs and deprecation notices. [Click Me](versionl
 - Cooperative process scheduler
 - System calls
 - WASM application runtime
-- Basic userspace window creation and rendering
+- Basic userspace window creation and rendering-->
 
 ## Source
 Uses nightly Rust and the `bootloader` crate to create a UEFI bootable image. The kernel is written in Rust and uses the `x86_64` crate for low-level architecture-specific functionality.

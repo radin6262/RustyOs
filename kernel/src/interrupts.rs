@@ -21,54 +21,83 @@ use crate::{
 // ============================================================
 // Programmable Interrupt Controller (PIC) Configuration
 // ============================================================
+//
+// PIC IRQ layout:
+//
+// PIC 1:
+//   IRQ 0 -> vector 32 (0x20)
+//   IRQ 1 -> vector 33 (0x21)
+//   ...
+//   IRQ 7 -> vector 39 (0x27)
+//
+// PIC 2:
+//   IRQ 8  -> vector 40 (0x28)
+//   ...
+//   IRQ 15 -> vector 47 (0x2F)
+//
+// Therefore vectors 32..47 are reserved for the remapped PIC.
+//
+// xHCI uses a separate vector.
+//
+// ============================================================
 
-pub const PIC_1_OFFSET: u8 =
-    32;
+pub const PIC_1_OFFSET: u8 = 32;
 
-pub const PIC_2_OFFSET: u8 =
-    PIC_1_OFFSET + 8;
+pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-pub static PICS:
-Mutex<ChainedPics> =
-    Mutex::new(
-        unsafe {
-            ChainedPics::new(
-                PIC_1_OFFSET,
-                PIC_2_OFFSET,
-            )
-        },
-    );
+// Dedicated xHCI interrupt vector.
+//
+// Keep this outside the remapped PIC range.
+//
+// 0x50 = 80 decimal.
+//
+// This is suitable as a dedicated MSI/MSI-X vector.
+//
+pub const XHCI_INTERRUPT_VECTOR: u8 = 0x50;
+
+// ============================================================
+// PIC
+// ============================================================
+
+pub static PICS: Mutex<ChainedPics> = Mutex::new(
+    unsafe {
+        ChainedPics::new(
+            PIC_1_OFFSET,
+            PIC_2_OFFSET,
+        )
+    },
+);
 
 // ============================================================
 // Static IDT storage
 // ============================================================
+//
+// The IDT must remain alive after init() returns.
+//
+// We therefore construct it in static storage and load a
+// &'static reference to it.
+//
+// ============================================================
 
 struct IdtStorage {
-    idt:
-        UnsafeCell<
-            MaybeUninit<
-                InterruptDescriptorTable,
-            >,
-        >,
+    idt: UnsafeCell<
+        MaybeUninit<InterruptDescriptorTable>,
+    >,
 }
 
-unsafe impl Sync
-for IdtStorage {
-}
+unsafe impl Sync for IdtStorage {}
 
 impl IdtStorage {
     const fn new() -> Self {
         Self {
-            idt:
-            UnsafeCell::new(
+            idt: UnsafeCell::new(
                 MaybeUninit::uninit(),
             ),
         }
     }
 }
 
-static IDT_STORAGE:
-IdtStorage =
+static IDT_STORAGE: IdtStorage =
     IdtStorage::new();
 
 // ============================================================
@@ -76,6 +105,10 @@ IdtStorage =
 // ============================================================
 
 pub fn init() {
+    // --------------------------------------------------------
+    // Construct a completely new IDT.
+    // --------------------------------------------------------
+
     let mut idt =
         InterruptDescriptorTable::new();
 
@@ -85,6 +118,9 @@ pub fn init() {
     // #SS = 12
     // #GP = 13
     // #PF = 14
+    //
+    // set_general_handler! generates the required wrapper
+    // functions for the different exception types.
     // --------------------------------------------------------
 
     set_general_handler!(
@@ -112,9 +148,11 @@ pub fn init() {
         );
 
     // --------------------------------------------------------
-    // Hardware Timer
+    // Hardware timer
     //
-    // IRQ 0 -> vector 32
+    // IRQ 0
+    //     |
+    //     +----> vector 32 / 0x20
     // --------------------------------------------------------
 
     idt[PIC_1_OFFSET]
@@ -123,7 +161,33 @@ pub fn init() {
         );
 
     // --------------------------------------------------------
+    // xHCI interrupt
+    //
+    // IMPORTANT:
+    //
+    // InterruptDescriptorTable implements Index<u8>,
+    // NOT Index<usize>.
+    //
+    // XHCI_INTERRUPT_VECTOR is already u8, so DO NOT do:
+    //
+    //     XHCI_INTERRUPT_VECTOR as usize
+    //
+    // Use the u8 directly.
+    // --------------------------------------------------------
+
+    idt[XHCI_INTERRUPT_VECTOR]
+        .set_handler_fn(
+            xhci_interrupt_handler,
+        );
+
+    // --------------------------------------------------------
     // Syscall
+    // --------------------------------------------------------
+    //
+    // This installs the existing syscall entry point.
+    //
+    // The syscall implementation owns its own ABI/assembly
+    // handling, so we leave that code untouched.
     // --------------------------------------------------------
 
     unsafe {
@@ -133,13 +197,17 @@ pub fn init() {
     }
 
     // --------------------------------------------------------
-    // Store IDT permanently.
+    // Move IDT into permanent static storage.
     // --------------------------------------------------------
 
     unsafe {
         (*IDT_STORAGE.idt.get())
             .write(idt);
     }
+
+    // --------------------------------------------------------
+    // Obtain the permanent IDT reference.
+    // --------------------------------------------------------
 
     let idt_ref:
         &'static InterruptDescriptorTable =
@@ -151,7 +219,7 @@ pub fn init() {
         };
 
     // --------------------------------------------------------
-    // Load IDT
+    // Load IDTR.
     // --------------------------------------------------------
 
     unsafe {
@@ -159,7 +227,7 @@ pub fn init() {
     }
 
     // --------------------------------------------------------
-    // Initialize PIC
+    // Initialize the remapped PIC.
     // --------------------------------------------------------
 
     unsafe {
@@ -173,47 +241,48 @@ pub fn init() {
 // Hardware Timer Interrupt
 // ============================================================
 //
-// For now this only acknowledges the timer IRQ.
+// IRQ 0 -> PIC vector 32.
 //
-// We deliberately do NOT call process scheduling here yet.
+// We deliberately do NOT perform scheduling here.
 //
-// Why?
-//
-// `SavedUserContext` contains:
+// A normal x86-interrupt Rust handler only receives the CPU
+// interrupt stack frame. It does not expose all GPRs:
 //
 //     rax rbx rcx rdx
 //     rsi rdi rbp
 //     r8-r15
-//     rip cs rflags rsp ss
 //
-// A normal `extern "x86-interrupt"` handler does not give us
-// those general-purpose registers as a `SavedUserContext`.
+// Your scheduler requires the complete SavedUserContext.
 //
-// Our syscall path already has custom assembly that saves them.
-//
-// The correct preemptive implementation will therefore be:
+// Therefore:
 //
 //     timer IRQ
-//        ↓
+//          |
+//          v
 //     assembly entry
-//        ↓
+//          |
+//          v
 //     save GPRs
-//        ↓
+//          |
+//          v
 //     build SavedUserContext
-//        ↓
+//          |
+//          v
 //     scheduler
-//        ↓
-//     restore next context
-//        ↓
-//     iretq
+//          |
+//          v
+//     restore context
+//          |
+//          v
+//        iretq
 //
-// Do not fake this with a normal Rust function call.
+// Do not fake preemptive scheduling by calling the scheduler
+// directly from this Rust handler.
 //
 
 extern "x86-interrupt" fn
 timer_interrupt_handler(
-    _stack_frame:
-    InterruptStackFrame,
+    _stack_frame: InterruptStackFrame,
 ) {
     // --------------------------------------------------------
     // Acknowledge IRQ 0.
@@ -229,18 +298,63 @@ timer_interrupt_handler(
 }
 
 // ============================================================
+// xHCI Interrupt
+// ============================================================
+//
+// This handler is intentionally lightweight.
+//
+// The xHCI controller should be configured to generate an
+// interrupt using the XHCI_INTERRUPT_VECTOR vector.
+//
+// Do not perform large USB operations directly from the IDT
+// handler.
+//
+// The normal design is:
+//
+//     xHCI hardware
+//          |
+//          v
+//     IDT handler
+//          |
+//          v
+//     acknowledge / mark pending
+//          |
+//          v
+//     USB poll/service path
+//          |
+//          v
+//     CrabUSB
+//
+// This is especially important because CrabUSB is asynchronous.
+// Its event processing should remain in the normal USB service
+// path rather than doing enumeration/control transfers from
+// interrupt context.
+//
+
+extern "x86-interrupt" fn
+xhci_interrupt_handler(
+    _stack_frame: InterruptStackFrame,
+) {
+    // --------------------------------------------------------
+    // Record that xHCI generated an interrupt.
+    //
+    // The actual xHCI event-ring processing remains in the
+    // normal USB polling/service path.
+    // --------------------------------------------------------
+
+    serial::write_str(
+        "INTERRUPT: xHCI\n",
+    );
+}
+
+// ============================================================
 // General exception handler
 // ============================================================
 
 fn general_exception_handler(
-    stack_frame:
-    InterruptStackFrame,
-
-    index:
-    u8,
-
-    error_code:
-    Option<u64>,
+    stack_frame: InterruptStackFrame,
+    index: u8,
+    error_code: Option<u64>,
 ) {
     serial::write_str(
         "\n\n=== CPU EXCEPTION ===\n",
@@ -353,7 +467,6 @@ fn general_exception_handler(
             //
             // Bit 7:
             //     1 = RMP violation
-            //
             // ------------------------------------------------
 
             if index == 14 {
@@ -421,17 +534,16 @@ fn general_exception_handler(
                     );
                 }
 
-                // --------------------------------------------
-                // Convenient interpretation for the common
-                // NX case:
+                // ------------------------------------------------
+                // Common NX interpretation:
                 //
-                //     protection violation
-                //     user
-                //     instruction fetch
+                // protection violation
+                // + user
+                // + instruction fetch
                 //
-                // This usually means the target page is marked
-                // NX / NO_EXECUTE.
-                // --------------------------------------------
+                // This is consistent with attempting to execute
+                // from a page that is not executable.
+                // ------------------------------------------------
 
                 if value & 1 != 0
                     && value & 4 != 0
@@ -464,8 +576,7 @@ fn general_exception_handler(
 
 extern "x86-interrupt" fn
 invalid_opcode_handler(
-    stack_frame:
-    InterruptStackFrame,
+    stack_frame: InterruptStackFrame,
 ) {
     serial::write_str(
         "\n\n=== INVALID OPCODE ===\n",
@@ -504,11 +615,8 @@ invalid_opcode_handler(
 
 extern "x86-interrupt" fn
 double_fault_handler(
-    stack_frame:
-    InterruptStackFrame,
-
-    error_code:
-    u64,
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
 ) -> ! {
     serial::write_str(
         "\n\n=== DOUBLE FAULT ===\n",

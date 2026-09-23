@@ -240,7 +240,7 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
         "BOOT: calling USB poll...\n",
     );
 
-    crate::usb::poll::poll();
+    // crate::usb::poll::poll();
 
     crate::delay::delay_seconds(1);
 

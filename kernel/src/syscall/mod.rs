@@ -1680,7 +1680,7 @@ fn syscall_launch_app(
 //
 
 fn service_usb() {
-    crate::usb::poll::poll();
+    // crate::usb::poll::poll();
 }
 
 fn service_mouse() {
