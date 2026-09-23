@@ -1,10 +1,10 @@
 # RustyOS
 
+> This Project is discontinued. i honestly rage quit because i absouletely could not make the xhci driver work
+
 RustyOS is a lightweight hobby operating system written in Rust.
 
-a simple modern uefi hobby operating system
 
-> This Project is discontinued. i honestly rage quit because i absouletely could not make the xhci driver work
 <!--## Version Logs
 Version logs will contain changlogs and deprecation notices. [Click Me](versionlogs.md) to go version logs-->
 
