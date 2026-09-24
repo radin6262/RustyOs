@@ -1,14 +1,10 @@
 # RustyOS
 
-> This Project is discontinued. i honestly rage quit because i absouletely could not make the xhci driver work
-
 RustyOS is a lightweight hobby operating system written in Rust.
 
+> Warning: Xhci driver only works on asus tuf f15 laptop due to xhci filtering(but soon we will initlize each controller and bring full device support to each pc and laptop)
 
-<!--## Version Logs
-Version logs will contain changlogs and deprecation notices. [Click Me](versionlogs.md) to go version logs-->
-
-<!--## Features
+## Features
 
 - UEFI boot
 - x86_64 kernel
@@ -24,8 +20,8 @@ Version logs will contain changlogs and deprecation notices. [Click Me](versionl
 - CR3 context switching
 - Cooperative process scheduler
 - System calls
-- WASM application runtime
-- Basic userspace window creation and rendering-->
+- Basic userspace window creation and rendering
+- XHCI driver support for real hardware
 
 ## Source
 Uses nightly Rust and the `bootloader` crate to create a UEFI bootable image. The kernel is written in Rust and uses the `x86_64` crate for low-level architecture-specific functionality.
