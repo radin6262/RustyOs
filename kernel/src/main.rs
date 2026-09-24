@@ -6,28 +6,29 @@ use core::panic::PanicInfo;
 
 extern crate alloc;
 
+mod ax_sync;
 mod cpu;
+mod delay;
+mod elf;
 mod font;
 mod graphics;
 mod input;
 mod interrupts;
+mod launch_app;
 mod memory;
 mod process;
 mod programs;
 mod serial;
 mod syscall;
+mod usb;
 mod user;
 mod wm;
-mod delay;
-mod elf;
-mod launch_app;
 mod xhci_pci;
-mod usb;
-mod ax_sync;
 
-use bootloader_api::{BootInfo,
-                     config::{BootloaderConfig, Mapping},
-                     entry_point,
+use bootloader_api::{
+    BootInfo,
+    config::{BootloaderConfig, Mapping},
+    entry_point,
 };
 
 // ============================================================
@@ -48,12 +49,8 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 // Kernel entry
 // ============================================================
 
-fn kernel_main(
-    boot_info: &'static mut BootInfo,
-) -> ! {
-    programs::boothandler::run_boot_sequence(
-        boot_info,
-    );
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    programs::boothandler::run_boot_sequence(boot_info);
 
     // if let Some(mouse) = crate::input::poll_mouse() {
     //     crate::serial::write_str("MOUSE EVENT\n");
@@ -76,15 +73,9 @@ fn kernel_main(
     //     crate::serial::write_str("\n");
     // }
 
-    let selectors =
-        cpu::gdt::init();
+    let selectors = cpu::gdt::init();
 
-    launch_app::run(
-        selectors,
-        include_bytes!("../../user/terminal/Terminal"),
-    );
-
-
+    launch_app::run(selectors, include_bytes!("../../user/terminal/Terminal"));
 
     // Kernel idle loop once boot sequence completes
     halt();
@@ -106,35 +97,19 @@ fn halt() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    crate::serial::write_str(
-        "\n\nRUSTY PANIC\n",
-    );
+    crate::serial::write_str("\n\nUh oh! Something went Wrong!\n");
 
     if let Some(location) = info.location() {
-        crate::serial::write_str(
-            "file: ",
-        );
-        crate::serial::write_str(
-            location.file(),
-        );
+        crate::serial::write_str("file: ");
+        crate::serial::write_str(location.file());
 
-        crate::serial::write_str(
-            "\nline: ",
-        );
-        crate::serial::write_usize(
-            location.line() as usize,
-        );
+        crate::serial::write_str("\nline: ");
+        crate::serial::write_usize(location.line() as usize);
 
-        crate::serial::write_str(
-            "\ncolumn: ",
-        );
-        crate::serial::write_usize(
-            location.column() as usize,
-        );
+        crate::serial::write_str("\ncolumn: ");
+        crate::serial::write_usize(location.column() as usize);
 
-        crate::serial::write_str(
-            "\n",
-        );
+        crate::serial::write_str("\n");
     }
 
     loop {
