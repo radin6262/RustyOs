@@ -184,7 +184,7 @@ const XHCI_RESET_ALL_ONES_GRACE_US: u64 = 10_000;
  * or PORTSC.WR is held high; the controller owns those reset timings.
  */
 /* Linux HUB_RESET_TIMEOUT: 800 ms. */
-const USB2_PORT_RESET_TIMEOUT_US: u64 = 100_000;
+const USB2_PORT_RESET_TIMEOUT_US: u64 = 800_000;
 const USB3_WARM_RESET_TIMEOUT_US: u64 = 800_000;
 
 /*
@@ -285,8 +285,7 @@ const LEGACY_CONTROL_OFFSET: usize = 0x04;
 const LEGACY_BIOS_OWNED: u32 = 1 << 16;
 const LEGACY_OS_OWNED: u32 = 1 << 24;
 
-const LEGACY_DISABLE_SMI: u32 =
-    (0x7 << 1) | (0xFF << 5) | (0x7 << 17);
+const LEGACY_DISABLE_SMI: u32 = (0x7 << 1) | (0xFF << 5) | (0x7 << 17);
 
 const LEGACY_SMI_EVENTS: u32 = 0x7 << 29;
 
@@ -315,8 +314,7 @@ const PORTSC_DEVICE_REMOVABLE: u32 = 1 << 30;
 const PORTSC_RO_PRESERVE: u32 =
     PORTSC_CCS | PORTSC_OCA | PORTSC_SPEED_MASK | PORTSC_DEVICE_REMOVABLE;
 
-const PORTSC_STATE_PRESERVE: u32 =
-    PORTSC_PLS_MASK | PORTSC_PP | (0x3 << 14) | (0x7 << 25);
+const PORTSC_STATE_PRESERVE: u32 = PORTSC_PLS_MASK | PORTSC_PP | (0x3 << 14) | (0x7 << 25);
 
 const PORTSC_SAFE_PRESERVE: u32 = PORTSC_RO_PRESERVE | PORTSC_STATE_PRESERVE;
 
@@ -657,9 +655,7 @@ impl XhciDriver {
          * power-of-two size (with a 64-byte minimum) gives us that property
          * for the architecturally bounded DCBAA size.
          */
-        let dcbaa_alignment = dcbaa_size
-            .max(DCBAA_ALIGNMENT)
-            .next_power_of_two();
+        let dcbaa_alignment = dcbaa_size.max(DCBAA_ALIGNMENT).next_power_of_two();
 
         let dcbaa_phys = memory::allocate_dma_region(dcbaa_size, dcbaa_alignment, None)
             .expect("xHCI: failed to allocate DCBAA");
@@ -819,13 +815,9 @@ impl XhciDriver {
          * number and its PORTSC value is visible even if capability parsing later
          * fails.
          */
-        crate::serial::write_str(
-            "xHCI: RAW PORTSC immediately after BIOS -> OS handoff:\n",
-        );
+        crate::serial::write_str("xHCI: RAW PORTSC immediately after BIOS -> OS handoff:\n");
         driver.dump_ports();
-        crate::serial::write_str(
-            "xHCI: raw post-handoff PORTSC dump complete\n",
-        );
+        crate::serial::write_str("xHCI: raw post-handoff PORTSC dump complete\n");
 
         /*
          * Build the Linux-style physical USB2/USB3 root-port split before the
@@ -839,13 +831,9 @@ impl XhciDriver {
          * only reads capability registers, so these PORTSC values are still the
          * pre-HCRST firmware state.
          */
-        crate::serial::write_str(
-            "xHCI: MAPPED PORTSC immediately after BIOS -> OS handoff:\n",
-        );
+        crate::serial::write_str("xHCI: MAPPED PORTSC immediately after BIOS -> OS handoff:\n");
         driver.dump_ports();
-        crate::serial::write_str(
-            "xHCI: mapped post-handoff PORTSC dump complete\n",
-        );
+        crate::serial::write_str("xHCI: mapped post-handoff PORTSC dump complete\n");
 
         /*
          * Validate DMA memory.
@@ -962,9 +950,7 @@ impl XhciDriver {
         let mut offset = ((hccparams1 >> 16) & 0xFFFF) as usize;
 
         if offset == 0 {
-            crate::serial::write_str(
-                "xHCI: no USB Legacy Support capability present\n",
-            );
+            crate::serial::write_str("xHCI: no USB Legacy Support capability present\n");
             return;
         }
 
@@ -974,9 +960,7 @@ impl XhciDriver {
             seen += 1;
 
             if seen > 256 {
-                panic!(
-                    "xHCI: Extended Capability list appears cyclic during BIOS handoff",
-                );
+                panic!("xHCI: Extended Capability list appears cyclic during BIOS handoff",);
             }
 
             let capability_address = self
@@ -995,8 +979,7 @@ impl XhciDriver {
             }
 
             let capability_id = (header & XHCI_EXT_CAP_ID_MASK) as u8;
-            let next = ((header >> XHCI_EXT_CAP_NEXT_SHIFT)
-                & XHCI_EXT_CAP_NEXT_MASK) as usize;
+            let next = ((header >> XHCI_EXT_CAP_NEXT_SHIFT) & XHCI_EXT_CAP_NEXT_MASK) as usize;
 
             if capability_id == XHCI_EXT_CAPS_LEGACY {
                 crate::serial::write_str(
@@ -1016,28 +999,20 @@ impl XhciDriver {
                 }
 
                 if (legacy & LEGACY_BIOS_OWNED) != 0 {
-                    crate::serial::write_str(
-                        "xHCI: BIOS owns xHCI; requesting OS ownership\n",
-                    );
+                    crate::serial::write_str("xHCI: BIOS owns xHCI; requesting OS ownership\n");
 
-                    write_volatile(
-                        legacy_address as *mut u32,
-                        legacy | LEGACY_OS_OWNED,
-                    );
+                    write_volatile(legacy_address as *mut u32, legacy | LEGACY_OS_OWNED);
 
                     let _ = read_volatile(legacy_address as *const u32);
 
                     let start_us = crate::delay::now_us();
-                    let deadline_us =
-                        start_us.saturating_add(XHCI_BIOS_HANDOFF_TIMEOUT_US);
+                    let deadline_us = start_us.saturating_add(XHCI_BIOS_HANDOFF_TIMEOUT_US);
 
                     loop {
                         legacy = read_volatile(legacy_address as *const u32);
 
                         if legacy == u32::MAX {
-                            panic!(
-                                "xHCI: controller became inaccessible during BIOS handoff",
-                            );
+                            panic!("xHCI: controller became inaccessible during BIOS handoff",);
                         }
 
                         if (legacy & LEGACY_BIOS_OWNED) == 0 {
@@ -1053,8 +1028,7 @@ impl XhciDriver {
                              * Match Linux's fallback for firmware that does not
                              * release the BIOS-owned semaphore.
                              */
-                            let current =
-                                read_volatile(legacy_address as *const u32);
+                            let current = read_volatile(legacy_address as *const u32);
 
                             write_volatile(
                                 legacy_address as *mut u32,
@@ -1079,10 +1053,7 @@ impl XhciDriver {
                 }
 
                 if (legacy & LEGACY_OS_OWNED) == 0 {
-                    write_volatile(
-                        legacy_address as *mut u32,
-                        legacy | LEGACY_OS_OWNED,
-                    );
+                    write_volatile(legacy_address as *mut u32, legacy | LEGACY_OS_OWNED);
                     let _ = read_volatile(legacy_address as *const u32);
                 }
 
@@ -1098,23 +1069,18 @@ impl XhciDriver {
                      * preserve the defined control fields, turn off all SMI
                      * enables, and write 1 to the RW1C SMI event bits.
                      */
-                    let new_control =
-                        (control & LEGACY_DISABLE_SMI) | LEGACY_SMI_EVENTS;
+                    let new_control = (control & LEGACY_DISABLE_SMI) | LEGACY_SMI_EVENTS;
 
                     write_volatile(control_address as *mut u32, new_control);
 
                     let _ = read_volatile(control_address as *const u32);
 
-                    crate::serial::write_str(
-                        "xHCI: legacy SMI sources disabled, control=0x",
-                    );
+                    crate::serial::write_str("xHCI: legacy SMI sources disabled, control=0x");
                     crate::serial::write_hex(new_control as u64);
                     crate::serial::write_str("\n");
                 }
 
-                crate::serial::write_str(
-                    "xHCI: BIOS -> OS ownership handoff complete\n",
-                );
+                crate::serial::write_str("xHCI: BIOS -> OS ownership handoff complete\n");
                 return;
             }
 
@@ -1127,9 +1093,7 @@ impl XhciDriver {
                 .expect("xHCI: malformed Extended Capability chain");
         }
 
-        crate::serial::write_str(
-            "xHCI: no USB Legacy Support capability present\n",
-        );
+        crate::serial::write_str("xHCI: no USB Legacy Support capability present\n");
     }
 
     /*
@@ -1636,10 +1600,7 @@ impl XhciDriver {
             } else {
                 /* Re-publish the already allocated scratchpad array. */
                 write_volatile(self.dcbaa_virt as *mut u64, self.scratchpad_array_phys);
-                dma_sync_for_device(
-                    self.dcbaa_virt as *const u8,
-                    DCBAA_ENTRY_SIZE,
-                );
+                dma_sync_for_device(self.dcbaa_virt as *const u8, DCBAA_ENTRY_SIZE);
             }
         }
 
@@ -2334,8 +2295,7 @@ impl XhciDriver {
     fn wait_for_command_clear(&self, mask: u32, timeout_us: u64) {
         let start_us = crate::delay::now_us();
         let deadline_us = start_us.saturating_add(timeout_us);
-        let all_ones_deadline_us =
-            start_us.saturating_add(XHCI_RESET_ALL_ONES_GRACE_US);
+        let all_ones_deadline_us = start_us.saturating_add(XHCI_RESET_ALL_ONES_GRACE_US);
 
         loop {
             let command = self.regs.usbcmd();
@@ -2454,10 +2414,7 @@ impl XhciDriver {
             );
         }
 
-        dma_sync_for_device(
-            self.scratchpad_array_virt as *const u8,
-            array_size,
-        );
+        dma_sync_for_device(self.scratchpad_array_virt as *const u8, array_size);
 
         /*
          * DCBAA[0] = scratchpad buffer array.
@@ -2840,9 +2797,7 @@ impl XhciDriver {
              * When PPC is clear, port power is not software-controlled. The
              * platform/controller provides the port power state instead.
              */
-            crate::serial::write_str(
-                "xHCI: root-port power is not software controlled (PPC=0)\n",
-            );
+            crate::serial::write_str("xHCI: root-port power is not software controlled (PPC=0)\n");
             return;
         }
 
@@ -2931,17 +2886,13 @@ impl XhciDriver {
                  * states.  A healthy connected U0 port is left alone.
                  */
                 let pls = ((portsc & PORTSC_PLS_MASK) >> 5) as u8;
-                let warm_reset_required =
-                    (portsc & PORTSC_CAS) != 0
-                        || pls == PORTSC_PLS_INACTIVE
-                        || pls == PORTSC_PLS_COMPLIANCE;
+                let warm_reset_required = (portsc & PORTSC_CAS) != 0
+                    || pls == PORTSC_PLS_INACTIVE
+                    || pls == PORTSC_PLS_COMPLIANCE;
 
                 if warm_reset_required {
                     self.warm_reset_usb3_port(port);
-                } else if (portsc & PORTSC_CCS) != 0
-                    && (portsc & PORTSC_PED) != 0
-                    && pls == 0
-                {
+                } else if (portsc & PORTSC_CCS) != 0 && (portsc & PORTSC_PED) != 0 && pls == 0 {
                     crate::serial::write_str("xHCI: USB3 device ready on PORT ");
                     crate::serial::write_hex(port as u64);
                     crate::serial::write_str("\n");
@@ -3060,7 +3011,9 @@ impl XhciDriver {
          */
         if (value & PORTSC_PR) != 0 || (value & PORTSC_PRC) == 0 {
             if now_us >= self.port_reset_deadline_us[port - 1] {
-                crate::serial::write_str("xHCI: USB2 port reset timed out waiting for PR/PRC PORT ");
+                crate::serial::write_str(
+                    "xHCI: USB2 port reset timed out waiting for PR/PRC PORT ",
+                );
                 crate::serial::write_hex(port as u64);
                 crate::serial::write_str(" PORTSC=0x");
                 crate::serial::write_hex(value as u64);
@@ -3221,8 +3174,8 @@ impl XhciDriver {
 
     pub unsafe fn service_interrupt(&mut self) {
         let pending = crate::interrupts::take_xhci_interrupt();
-        let controller_pending = (self.regs.iman(0) & IMAN_IP) != 0
-            || (self.regs.usbsts() & USBSTS_EINT) != 0;
+        let controller_pending =
+            (self.regs.iman(0) & IMAN_IP) != 0 || (self.regs.usbsts() & USBSTS_EINT) != 0;
 
         if pending || controller_pending {
             self.poll_events();
@@ -3286,7 +3239,6 @@ impl XhciDriver {
 
         fence(Ordering::SeqCst);
         self.regs.set_erdp_clear_busy(0, self.event_dequeue);
-
 
         /*
          * Clear the controller's event-interrupt indication after the event
@@ -3540,11 +3492,7 @@ impl XhciDriver {
                  * exactly Polling at this instant.  Never trigger reset from
                  * PRC alone.
                  */
-                if csc
-                    && connected
-                    && !enabled
-                    && !resetting
-                    && !self.port_reset_pending[port - 1]
+                if csc && connected && !enabled && !resetting && !self.port_reset_pending[port - 1]
                 {
                     let _ = self.request_usb2_port_reset(port);
                 }
@@ -3566,14 +3514,10 @@ impl XhciDriver {
                  * recovery conditions for which a warm reset is appropriate.
                  */
                 let warm_reset_required =
-                    cas
-                        || pls == PORTSC_PLS_INACTIVE
-                        || pls == PORTSC_PLS_COMPLIANCE;
+                    cas || pls == PORTSC_PLS_INACTIVE || pls == PORTSC_PLS_COMPLIANCE;
 
                 if warm_reset_required {
-                    crate::serial::write_str(
-                        "xHCI: USB3 warm-reset recovery condition on PORT ",
-                    );
+                    crate::serial::write_str("xHCI: USB3 warm-reset recovery condition on PORT ");
                     crate::serial::write_hex(port as u64);
                     crate::serial::write_str(" PLS=");
                     crate::serial::write_hex(pls as u64);
@@ -3587,9 +3531,7 @@ impl XhciDriver {
                         crate::serial::write_hex(port as u64);
                         crate::serial::write_str("\n");
                     } else {
-                        crate::serial::write_str(
-                            "xHCI: USB3 connected but link not ready PORT ",
-                        );
+                        crate::serial::write_str("xHCI: USB3 connected but link not ready PORT ");
                         crate::serial::write_hex(port as u64);
                         crate::serial::write_str(" PLS=");
                         crate::serial::write_hex(pls as u64);
@@ -3805,8 +3747,7 @@ impl XhciDriver {
         write_volatile((input_virt + 4) as *mut u32, 0x0000_0003);
 
         /* Slot Context. */
-        let slot_dword0 =
-            ((speed as u32) << 20) | (1u32 << 27);
+        let slot_dword0 = ((speed as u32) << 20) | (1u32 << 27);
         let slot_dword1 = (port as u32 & 0xFF) << 16;
 
         write_volatile(slot_ctx as *mut u32, slot_dword0);
@@ -3823,26 +3764,15 @@ impl XhciDriver {
         write_volatile((ep0_ctx + 8) as *mut u64, ring_phys | 1);
         write_volatile((ep0_ctx + 16) as *mut u32, 8);
 
-        dma_sync_for_device(
-            input_virt as *const u8,
-            stride * 3,
-        );
+        dma_sync_for_device(input_virt as *const u8, stride * 3);
         fence(Ordering::SeqCst);
 
-        let command = Trb::new(
-            input_phys,
-            0,
-            (TrbType::AddressDeviceCommand as u32) << 10,
-        );
+        let command = Trb::new(input_phys, 0, (TrbType::AddressDeviceCommand as u32) << 10);
 
         let mut command = command;
         command.set_slot_id(slot_id);
 
-        let Some(completion) = self.submit_command_wait(
-            command,
-            None,
-            1_000_000,
-        ) else {
+        let Some(completion) = self.submit_command_wait(command, None, 1_000_000) else {
             return false;
         };
 
@@ -3920,13 +3850,9 @@ impl XhciDriver {
          * stale state from the Output Device Context can be rejected by real
          * controllers even though an emulator may tolerate it.
          */
-        let mut ep_info =
-            read_volatile(input_ep0 as *const u32);
+        let mut ep_info = read_volatile(input_ep0 as *const u32);
         ep_info &= !0x7;
-        write_volatile(
-            input_ep0 as *mut u32,
-            ep_info,
-        );
+        write_volatile(input_ep0 as *mut u32, ep_info);
 
         let mut ep_info2 = read_volatile((input_ep0 + 4) as *const u32);
         ep_info2 &= !(0xFFFFu32 << 16);
@@ -3973,11 +3899,7 @@ impl XhciDriver {
         self.prepare_address_device_context(slot_id, port, speed, max_packet_size)
     }
 
-    pub unsafe fn update_ep0_max_packet_size(
-        &mut self,
-        slot_id: u8,
-        max_packet_size: u16,
-    ) -> bool {
+    pub unsafe fn update_ep0_max_packet_size(&mut self, slot_id: u8, max_packet_size: u16) -> bool {
         self.evaluate_ep0_max_packet(slot_id, max_packet_size)
     }
 
@@ -4011,7 +3933,8 @@ impl XhciDriver {
         value: u16,
         index: u16,
     ) -> bool {
-        self.control_transfer(slot_id, request_type, request, value, index, None).is_some()
+        self.control_transfer(slot_id, request_type, request, value, index, None)
+            .is_some()
     }
 
     unsafe fn control_transfer(
@@ -4053,9 +3976,7 @@ impl XhciDriver {
         let direction_in = (request_type & 0x80) != 0;
 
         if data_len != 0 && !direction_in {
-            crate::serial::write_str(
-                "xHCI: control_transfer_in called with an OUT data stage\n",
-            );
+            crate::serial::write_str("xHCI: control_transfer_in called with an OUT data stage\n");
             return None;
         }
 
@@ -4066,39 +3987,22 @@ impl XhciDriver {
              * avoids relying on an emulator that may accept boundary-crossing
              * transfers.
              */
-            data_phys =
-                memory::allocate_dma_region(
-                    data_len,
-                    XHCI_CONTROL_DMA_ALIGNMENT,
-                    None,
-                )?;
+            data_phys = memory::allocate_dma_region(data_len, XHCI_CONTROL_DMA_ALIGNMENT, None)?;
 
-            data_virt =
-                memory::physical_to_virtual(
-                    data_phys,
-                ) as usize;
+            data_virt = memory::physical_to_virtual(data_phys) as usize;
 
             if data_virt == 0 {
                 return None;
             }
 
-            write_bytes(
-                data_virt as *mut u8,
-                0,
-                data_len,
-            );
+            write_bytes(data_virt as *mut u8, 0, data_len);
 
-            dma_sync_for_device(
-                data_virt as *const u8,
-                data_len,
-            );
+            dma_sync_for_device(data_virt as *const u8, data_len);
         }
 
-        let ring =
-            self.ep0_rings[slot].as_mut()?;
+        let ring = self.ep0_rings[slot].as_mut()?;
 
-        let setup_value =
-            request_type as u64
+        let setup_value = request_type as u64
             | ((request as u64) << 8)
             | ((value as u64) << 16)
             | ((index as u64) << 32)
@@ -4115,77 +4019,33 @@ impl XhciDriver {
          * hard-coded 2 for every data-bearing request, which made
          * GET_DESCRIPTOR advertise OUT while the Data TRB advertised IN.
          */
-        let setup_transfer_type =
-            if data_len == 0 {
-                0
-            } else if direction_in {
-                3
-            } else {
-                2
-            };
+        let setup_transfer_type = if data_len == 0 {
+            0
+        } else if direction_in {
+            3
+        } else {
+            2
+        };
 
-        crate::serial::write_str(
-            "xHCI: control TD slot=",
-        );
-        crate::serial::write_hex(
-            slot_id as u64,
-        );
-        crate::serial::write_str(
-            " ep=1 reqtype=",
-        );
-        crate::serial::write_hex(
-            request_type as u64,
-        );
-        crate::serial::write_str(
-            " req=",
-        );
-        crate::serial::write_hex(
-            request as u64,
-        );
-        crate::serial::write_str(
-            " value=",
-        );
-        crate::serial::write_hex(
-            value as u64,
-        );
-        crate::serial::write_str(
-            " index=",
-        );
-        crate::serial::write_hex(
-            index as u64,
-        );
-        crate::serial::write_str(
-            " len=",
-        );
-        crate::serial::write_hex(
-            data_len as u64,
-        );
-        crate::serial::write_str(
-            " TRT=",
-        );
-        crate::serial::write_hex(
-            setup_transfer_type as u64,
-        );
-        crate::serial::write_str(
-            " DIR=",
-        );
-        crate::serial::write_str(
-            if direction_in {
-                "IN"
-            } else {
-                "OUT"
-            },
-        );
-        crate::serial::write_str(
-            "\n",
-        );
+        crate::serial::write_str("xHCI: control TD slot=");
+        crate::serial::write_hex(slot_id as u64);
+        crate::serial::write_str(" ep=1 reqtype=");
+        crate::serial::write_hex(request_type as u64);
+        crate::serial::write_str(" req=");
+        crate::serial::write_hex(request as u64);
+        crate::serial::write_str(" value=");
+        crate::serial::write_hex(value as u64);
+        crate::serial::write_str(" index=");
+        crate::serial::write_hex(index as u64);
+        crate::serial::write_str(" len=");
+        crate::serial::write_hex(data_len as u64);
+        crate::serial::write_str(" TRT=");
+        crate::serial::write_hex(setup_transfer_type as u64);
+        crate::serial::write_str(" DIR=");
+        crate::serial::write_str(if direction_in { "IN" } else { "OUT" });
+        crate::serial::write_str("\n");
 
-        let mut setup =
-            Trb::new(
-                setup_value,
-                8,
-                (TrbType::SetupStage as u32) << 10,
-            );
+        let mut setup = Trb::new(setup_value, 8, (TrbType::SetupStage as u32) << 10);
 
         /*
          * The Setup TRB is followed by the Status TRB even for a no-data
@@ -4194,76 +4054,48 @@ impl XhciDriver {
          */
         setup.set_immediate_data(true);
         setup.set_chain(true);
-        setup.set_transfer_type(
-            setup_transfer_type,
-        );
+        setup.set_transfer_type(setup_transfer_type);
 
-        let _setup_phys =
-            ring.push(setup);
+        let _setup_phys = ring.push(setup);
 
         if data_len != 0 {
-            let mut data_trb =
-                Trb::new(
-                    data_phys,
-                    data_len as u32,
-                    (TrbType::DataStage as u32) << 10,
-                );
-
-            data_trb.set_direction_in(
-                direction_in,
+            let mut data_trb = Trb::new(
+                data_phys,
+                data_len as u32,
+                (TrbType::DataStage as u32) << 10,
             );
+
+            data_trb.set_direction_in(direction_in);
 
             /*
              * Match Linux's control-transfer Data TRB construction: IN data
              * stages use Interrupt-on-Short-Packet so a short descriptor is a
              * normal completion rather than a lost transfer.
              */
-            data_trb.set_interrupt_on_short_packet(
-                direction_in,
-            );
+            data_trb.set_interrupt_on_short_packet(direction_in);
 
             data_trb.set_chain(true);
             ring.push(data_trb);
         }
 
-        let mut status_trb =
-            Trb::new(
-                0,
-                0,
-                (TrbType::StatusStage as u32) << 10,
-            );
+        let mut status_trb = Trb::new(0, 0, (TrbType::StatusStage as u32) << 10);
 
         /*
          * Status direction is opposite the data direction.  For a no-data
          * control transfer the status stage is IN.
          */
-        status_trb.set_direction_in(
-            if data_len == 0 {
-                true
-            } else {
-                !direction_in
-            },
-        );
+        status_trb.set_direction_in(if data_len == 0 { true } else { !direction_in });
 
-        status_trb.set_interrupt_on_completion(
-            true,
-        );
+        status_trb.set_interrupt_on_completion(true);
 
-        let status_phys =
-            ring.push(status_trb);
+        let status_phys = ring.push(status_trb);
 
-        dma_sync_for_device(
-            ring.buffer.as_ptr() as *const u8,
-            ring.size * XHCI_TRB_SIZE,
-        );
+        dma_sync_for_device(ring.buffer.as_ptr() as *const u8, ring.size * XHCI_TRB_SIZE);
         fence(Ordering::SeqCst);
 
         self.regs.ring_doorbell(slot_id, 1);
 
-        let deadline =
-            crate::delay::now_us().saturating_add(
-                XHCI_CONTROL_TRANSFER_TIMEOUT_US,
-            );
+        let deadline = crate::delay::now_us().saturating_add(XHCI_CONTROL_TRANSFER_TIMEOUT_US);
 
         loop {
             self.poll_events();
@@ -4278,7 +4110,9 @@ impl XhciDriver {
                     return None;
                 }
 
-                let actual = data_len.saturating_sub(completion.transfer_length as usize).min(data_len);
+                let actual = data_len
+                    .saturating_sub(completion.transfer_length as usize)
+                    .min(data_len);
 
                 if let Some(buffer) = data_in {
                     dma_sync_for_cpu(data_virt as *const u8, data_len);
@@ -4293,51 +4127,20 @@ impl XhciDriver {
             }
 
             if crate::delay::now_us() >= deadline {
-                crate::serial::write_str(
-                    "xHCI: control transfer timeout slot=",
-                );
-                crate::serial::write_hex(
-                    slot_id as u64,
-                );
-                crate::serial::write_str(
-                    " ep=1 status_trb=0x",
-                );
-                crate::serial::write_hex(
-                    status_phys,
-                );
-                crate::serial::write_str(
-                    " USBSTS=0x",
-                );
-                crate::serial::write_hex(
-                    self.regs.usbsts() as u64,
-                );
-                crate::serial::write_str(
-                    " CRCR=0x",
-                );
-                crate::serial::write_hex(
-                    self.regs.crcr(),
-                );
-                crate::serial::write_str(
-                    "\n",
-                );
-                let recovered =
-                    self.recover_ep0_after_timeout(
-                        slot_id,
-                    );
+                crate::serial::write_str("xHCI: control transfer timeout slot=");
+                crate::serial::write_hex(slot_id as u64);
+                crate::serial::write_str(" ep=1 status_trb=0x");
+                crate::serial::write_hex(status_phys);
+                crate::serial::write_str(" USBSTS=0x");
+                crate::serial::write_hex(self.regs.usbsts() as u64);
+                crate::serial::write_str(" CRCR=0x");
+                crate::serial::write_hex(self.regs.crcr());
+                crate::serial::write_str("\n");
+                let recovered = self.recover_ep0_after_timeout(slot_id);
 
-                crate::serial::write_str(
-                    "xHCI: EP0 timeout recovery=",
-                );
-                crate::serial::write_str(
-                    if recovered {
-                        "success"
-                    } else {
-                        "failed"
-                    },
-                );
-                crate::serial::write_str(
-                    "\n",
-                );
+                crate::serial::write_str("xHCI: EP0 timeout recovery=");
+                crate::serial::write_str(if recovered { "success" } else { "failed" });
+                crate::serial::write_str("\n");
 
                 return None;
             }
@@ -4373,52 +4176,29 @@ impl XhciDriver {
             None => return false,
         };
 
-        crate::serial::write_str(
-            "xHCI: recovering timed-out EP0 slot=",
-        );
-        crate::serial::write_hex(
-            slot_id as u64,
-        );
-        crate::serial::write_str(
-            "\n",
-        );
+        crate::serial::write_str("xHCI: recovering timed-out EP0 slot=");
+        crate::serial::write_hex(slot_id as u64);
+        crate::serial::write_str("\n");
 
         /*
          * First stop EP0 so the controller can no longer consume the stale
          * control TD while software resets the ring.
          */
-        let mut stop =
-            Trb::new(
-                0,
-                0,
-                (TrbType::StopEndpointCommand as u32) << 10,
-            );
+        let mut stop = Trb::new(0, 0, (TrbType::StopEndpointCommand as u32) << 10);
         stop.set_slot_id(slot_id);
         stop.set_endpoint_id(1);
 
         let Some(stop_completion) =
-            self.submit_command_wait(
-                stop,
-                None,
-                XHCI_CONTROL_TRANSFER_TIMEOUT_US,
-            )
+            self.submit_command_wait(stop, None, XHCI_CONTROL_TRANSFER_TIMEOUT_US)
         else {
-            crate::serial::write_str(
-                "xHCI: EP0 Stop Endpoint timed out\n",
-            );
+            crate::serial::write_str("xHCI: EP0 Stop Endpoint timed out\n");
             return false;
         };
 
         if stop_completion.completion_code != 1 {
-            crate::serial::write_str(
-                "xHCI: EP0 Stop Endpoint failed code=",
-            );
-            crate::serial::write_hex(
-                stop_completion.completion_code as u64,
-            );
-            crate::serial::write_str(
-                "\n",
-            );
+            crate::serial::write_str("xHCI: EP0 Stop Endpoint failed code=");
+            crate::serial::write_hex(stop_completion.completion_code as u64);
+            crate::serial::write_str("\n");
             return false;
         }
 
@@ -4427,18 +4207,13 @@ impl XhciDriver {
          * TRB.  The hardware dequeue pointer is moved separately below.
          */
         {
-            let Some(ring) =
-                self.ep0_rings[slot].as_mut()
-            else {
+            let Some(ring) = self.ep0_rings[slot].as_mut() else {
                 return false;
             };
 
             ring.reset();
 
-            dma_sync_for_device(
-                ring.buffer.as_ptr() as *const u8,
-                ring.size * XHCI_TRB_SIZE,
-            );
+            dma_sync_for_device(ring.buffer.as_ptr() as *const u8, ring.size * XHCI_TRB_SIZE);
         }
 
         fence(Ordering::SeqCst);
@@ -4448,38 +4223,25 @@ impl XhciDriver {
          * producer cycle state used by Ring::reset(). DCS is bit 0 of the
          * command parameter.
          */
-        let mut set_deq =
-            Trb::new(
-                ring_phys | 1,
-                0,
-                (TrbType::SetTrDequeuePointerCommand as u32) << 10,
-            );
+        let mut set_deq = Trb::new(
+            ring_phys | 1,
+            0,
+            (TrbType::SetTrDequeuePointerCommand as u32) << 10,
+        );
         set_deq.set_slot_id(slot_id);
         set_deq.set_endpoint_id(1);
 
         let Some(deq_completion) =
-            self.submit_command_wait(
-                set_deq,
-                None,
-                XHCI_CONTROL_TRANSFER_TIMEOUT_US,
-            )
+            self.submit_command_wait(set_deq, None, XHCI_CONTROL_TRANSFER_TIMEOUT_US)
         else {
-            crate::serial::write_str(
-                "xHCI: EP0 Set TR Dequeue Pointer timed out\n",
-            );
+            crate::serial::write_str("xHCI: EP0 Set TR Dequeue Pointer timed out\n");
             return false;
         };
 
         if deq_completion.completion_code != 1 {
-            crate::serial::write_str(
-                "xHCI: EP0 Set TR Dequeue Pointer failed code=",
-            );
-            crate::serial::write_hex(
-                deq_completion.completion_code as u64,
-            );
-            crate::serial::write_str(
-                "\n",
-            );
+            crate::serial::write_str("xHCI: EP0 Set TR Dequeue Pointer failed code=");
+            crate::serial::write_hex(deq_completion.completion_code as u64);
+            crate::serial::write_str("\n");
             return false;
         }
 
@@ -4488,26 +4250,13 @@ impl XhciDriver {
          * the HID layer. Do not let stale completions accumulate.
          */
         self.transfer_completions
-            .retain(|completion| {
-                !(completion.slot_id == slot_id
-                    && completion.endpoint_id == 1)
-            });
+            .retain(|completion| !(completion.slot_id == slot_id && completion.endpoint_id == 1));
 
-        crate::serial::write_str(
-            "xHCI: EP0 recovery complete slot=",
-        );
-        crate::serial::write_hex(
-            slot_id as u64,
-        );
-        crate::serial::write_str(
-            " ring=0x",
-        );
-        crate::serial::write_hex(
-            ring_phys,
-        );
-        crate::serial::write_str(
-            "\n",
-        );
+        crate::serial::write_str("xHCI: EP0 recovery complete slot=");
+        crate::serial::write_hex(slot_id as u64);
+        crate::serial::write_str(" ring=0x");
+        crate::serial::write_hex(ring_phys);
+        crate::serial::write_str("\n");
 
         true
     }
@@ -4540,9 +4289,7 @@ impl XhciDriver {
             return false;
         }
 
-        let endpoint_id = endpoint_number
-            .saturating_mul(2)
-            .saturating_add(1);
+        let endpoint_id = endpoint_number.saturating_mul(2).saturating_add(1);
 
         if endpoint_id > 31 || packet_size == 0 || packet_size > 1024 {
             return false;
@@ -4626,10 +4373,7 @@ impl XhciDriver {
         };
 
         let ep_info = (interval_field as u32) << 16;
-        let ep_info2 =
-            (3u32 << 1)
-            | (7u32 << 3)
-            | (((packet_size as u32) & 0xFFFF) << 16);
+        let ep_info2 = (3u32 << 1) | (7u32 << 3) | (((packet_size as u32) & 0xFFFF) << 16);
 
         write_volatile(input_ep as *mut u32, ep_info);
         write_volatile((input_ep + 4) as *mut u32, ep_info2);
@@ -4692,26 +4436,18 @@ impl XhciDriver {
      */
 
     pub unsafe fn submit_interrupt_in(&mut self, slot_id: u8, endpoint_id: u8) -> bool {
-        let index = match self
-            .interrupt_endpoints
-            .iter()
-            .position(|endpoint| endpoint.slot_id == slot_id && endpoint.endpoint_id == endpoint_id)
-        {
-            Some(index) => index,
-            None => return false,
-        };
+        let index =
+            match self.interrupt_endpoints.iter().position(|endpoint| {
+                endpoint.slot_id == slot_id && endpoint.endpoint_id == endpoint_id
+            }) {
+                Some(index) => index,
+                None => return false,
+            };
 
         let endpoint = &mut self.interrupt_endpoints[index];
 
-        write_bytes(
-            endpoint.buffer_virt as *mut u8,
-            0,
-            endpoint.packet_size,
-        );
-        dma_sync_for_device(
-            endpoint.buffer_virt as *const u8,
-            endpoint.packet_size,
-        );
+        write_bytes(endpoint.buffer_virt as *mut u8, 0, endpoint.packet_size);
+        dma_sync_for_device(endpoint.buffer_virt as *const u8, endpoint.packet_size);
 
         let mut trb = Trb::new(
             endpoint.buffer_phys,
@@ -4751,10 +4487,7 @@ impl XhciDriver {
         let length = destination.len().min(endpoint.packet_size);
 
         unsafe {
-            dma_sync_for_cpu(
-                endpoint.buffer_virt as *const u8,
-                endpoint.packet_size,
-            );
+            dma_sync_for_cpu(endpoint.buffer_virt as *const u8, endpoint.packet_size);
             core::ptr::copy_nonoverlapping(
                 endpoint.buffer_virt as *const u8,
                 destination.as_mut_ptr(),
@@ -4770,7 +4503,6 @@ impl XhciDriver {
             .iter()
             .any(|endpoint| endpoint.slot_id == slot_id && endpoint.endpoint_id == endpoint_id)
     }
-
 
     /*
      * ======================================================================
@@ -4813,7 +4545,9 @@ impl XhciDriver {
 
             if event.cycle_bit() != self.event_ring.current_cycle() {
                 if crate::delay::now_us() >= timeout {
-                    crate::serial::write_str("xHCI: Enable Slot command timed out waiting for event\n");
+                    crate::serial::write_str(
+                        "xHCI: Enable Slot command timed out waiting for event\n",
+                    );
                     return None;
                 }
 
@@ -4847,7 +4581,9 @@ impl XhciDriver {
                     self.regs.set_erdp_clear_busy(0, self.event_dequeue);
 
                     if completed_command != command_phys {
-                        crate::serial::write_str("xHCI: Command Completion does not match Enable Slot TRB\n");
+                        crate::serial::write_str(
+                            "xHCI: Command Completion does not match Enable Slot TRB\n",
+                        );
                         if crate::delay::now_us() >= timeout {
                             return None;
                         }
@@ -4940,15 +4676,9 @@ impl XhciDriver {
             write_bytes(virt as *mut u8, 0, context_bytes);
             dma_sync_for_device(virt as *const u8, context_bytes);
 
-            write_volatile(
-                (self.dcbaa_virt as *mut u64).add(slot),
-                phys,
-            );
+            write_volatile((self.dcbaa_virt as *mut u64).add(slot), phys);
 
-            dma_sync_for_device(
-                self.dcbaa_virt as *const u8,
-                (slot + 1) * DCBAA_ENTRY_SIZE,
-            );
+            dma_sync_for_device(self.dcbaa_virt as *const u8, (slot + 1) * DCBAA_ENTRY_SIZE);
         }
 
         fence(Ordering::SeqCst);
@@ -5198,9 +4928,7 @@ impl XhciDriver {
          */
         let stale_changes = portsc & (PORTSC_WRC | PORTSC_PRC);
         if stale_changes != 0 {
-            crate::serial::write_str(
-                "xHCI: clearing stale USB3 reset change bits PORT ",
-            );
+            crate::serial::write_str("xHCI: clearing stale USB3 reset change bits PORT ");
             crate::serial::write_hex(port as u64);
             crate::serial::write_str("\n");
 
@@ -5417,10 +5145,7 @@ unsafe fn dma_sync_for_device(address: *const u8, size: usize) {
             .expect("xHCI: DMA cache-sync iteration overflow");
     }
 
-    core::arch::asm!(
-        "mfence",
-        options(nostack, preserves_flags),
-    );
+    core::arch::asm!("mfence", options(nostack, preserves_flags),);
 
     fence(Ordering::SeqCst);
 }
