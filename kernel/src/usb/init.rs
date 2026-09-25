@@ -6,6 +6,7 @@ use core::{
 
 use crate::{memory, serial, xhci_pci};
 
+use super::hid::HidManager;
 use super::xhci::XhciDriver;
 
 // ============================================================
@@ -21,6 +22,7 @@ use super::xhci::XhciDriver;
 
 pub(crate) struct UsbState {
     pub(crate) xhci: XhciDriver,
+    pub(crate) hid: HidManager,
 }
 
 // ============================================================
@@ -556,6 +558,12 @@ pub fn init() {
     }
 
     // ========================================================
+    // Prepare HID manager
+    // ========================================================
+
+    let mut hid = HidManager::new();
+
+    // ========================================================
     // No connected USB2 device
     // ========================================================
 
@@ -563,9 +571,18 @@ pub fn init() {
         serial::write_str("USB: no connected USB2 root port found\n");
         serial::write_str("USB: skipping USB2 enumeration test\n");
 
+        let hid_has_keyboard = hid.has_keyboard();
+        let hid_has_mouse = hid.has_mouse();
+
         unsafe {
-            (*USB_STORAGE.state.get()).write(UsbState { xhci });
+            (*USB_STORAGE.state.get()).write(UsbState {
+                xhci,
+                hid,
+            });
         }
+
+        crate::input::set_keyboard_present(hid_has_keyboard);
+        crate::input::set_mouse_present(hid_has_mouse);
 
         USB_INITIALIZED.store(1, Ordering::Release);
 
@@ -713,32 +730,56 @@ pub fn init() {
     }
 
     // ========================================================
-    // Enable Slot command
+    // Custom USB HID enumeration
     // ========================================================
     //
-    // XhciDriver::enable_slot() submits the command, waits for the matching
-    // Command Completion Event, and returns the allocated slot ID.
+    // Enable Slot gives the device an xHCI Slot ID.  hid.rs then performs the
+    // real USB enumeration sequence:
+    //
+    //     Address Device
+    //     GET_DESCRIPTOR(Device)
+    //     GET_DESCRIPTOR(Configuration)
+    //     SET_CONFIGURATION
+    //     SET_PROTOCOL (boot HID)
+    //     Configure Endpoint
+    //     submit persistent interrupt-IN transfer
     //
     // ========================================================
 
     if connected && enabled && !reset_active {
         serial::write_str("USB: submitting Enable Slot command...\n");
 
-        let slot = unsafe { xhci.enable_slot() };
+        let slot_id = unsafe {
+            xhci.enable_slot()
+        };
 
-        match slot {
+        match slot_id {
             Some(slot_id) => {
-                serial::write_str("USB: Enable Slot completed, slot=");
+                serial::write_str("USB: Enable Slot succeeded, slot=");
                 serial::write_hex(slot_id as u64);
                 serial::write_str("\n");
+
+                serial::write_str("USB: starting USB device enumeration...\n");
+
+                if unsafe {
+                    hid.enumerate_device(
+                        &mut xhci,
+                        test_port,
+                        slot_id,
+                    )
+                } {
+                    serial::write_str("USB: USB device enumeration completed\n");
+                } else {
+                    serial::write_str("USB: USB device enumeration failed\n");
+                }
             }
 
             None => {
-                serial::write_str("USB: Enable Slot command failed or timed out\n");
+                serial::write_str("USB: Enable Slot failed\n");
             }
         }
     } else {
-        serial::write_str("USB: skipping Enable Slot because USB2 port is not ready\n");
+        serial::write_str("USB: skipping USB enumeration because USB2 port is not ready\n");
     }
 
     // ========================================================
@@ -755,9 +796,18 @@ pub fn init() {
     // Publish USB state
     // ========================================================
 
+    let hid_has_keyboard = hid.has_keyboard();
+    let hid_has_mouse = hid.has_mouse();
+
     unsafe {
-        (*USB_STORAGE.state.get()).write(UsbState { xhci });
+        (*USB_STORAGE.state.get()).write(UsbState {
+            xhci,
+            hid,
+        });
     }
+
+    crate::input::set_keyboard_present(hid_has_keyboard);
+    crate::input::set_mouse_present(hid_has_mouse);
 
     USB_INITIALIZED.store(1, Ordering::Release);
 

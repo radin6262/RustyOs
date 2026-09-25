@@ -34,22 +34,31 @@ const PCI_SUBCLASS_USB: u8 = 0x03;
 const PCI_PROGIF_XHCI: u8 = 0x30;
 
 // ============================================================
-// DEBUGGING MODE
+// Preferred xHCI controllers
 // ============================================================
 //
-// TEMPORARY DEBUG CONFIGURATION:
+// These are controllers we explicitly prefer when present.
 //
-// Only the Intel 8086:51ED xHCI controller is selected.
+// IMPORTANT:
 //
-// The ASUS TUF Gaming F15 being debugged has another xHCI
-// controller at 8086:461E.  We intentionally stay on 51ED until
-// USB enumeration is working.
+// This is NOT an allow-list.
+//
+// If none of these controllers exists, find_xhci() automatically
+// falls back to the first xHCI controller discovered on PCI.
+//
+// Add more preferred controllers here when desired.
+//
+// Example:
+//     (0x8086, 0x51ED),
+//     (0x8086, 0x461E),
+//
+// The order matters: the first matching preferred entry is
+// considered the preferred choice when multiple matching
+// controllers are present.
 //
 // ============================================================
 
-const DEBUG_XHCI_ONLY: bool = true;
-const DEBUG_XHCI_VENDOR_ID: u16 = 0x8086;
-const DEBUG_XHCI_DEVICE_ID: u16 = 0x51ED;
+const PREFERRED_XHCI_CONTROLLERS: &[(u16, u16)] = &[(0x8086, 0x51ED)];
 
 // ============================================================
 // PCI command/status bits
@@ -191,6 +200,7 @@ fn read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 
     unsafe {
         outl(PCI_CONFIG_ADDRESS, address);
+
         inl(PCI_CONFIG_DATA)
     }
 }
@@ -201,6 +211,7 @@ fn write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
 
     unsafe {
         outl(PCI_CONFIG_ADDRESS, address);
+
         outl(PCI_CONFIG_DATA, value);
     }
 }
@@ -208,25 +219,33 @@ fn write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
 #[inline(always)]
 fn read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
     let value = read_u32(bus, device, function, offset & !3);
+
     let shift = ((offset & 2) * 8) as u32;
+
     ((value >> shift) & 0xFFFF) as u16
 }
 
 #[inline(always)]
 fn write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
     let aligned = offset & !3;
+
     let mut current = read_u32(bus, device, function, aligned);
+
     let shift = ((offset & 2) * 8) as u32;
+
     let mask = 0xFFFFu32 << shift;
 
     current = (current & !mask) | ((value as u32) << shift);
+
     write_u32(bus, device, function, aligned, current);
 }
 
 #[inline(always)]
 fn read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
     let value = read_u32(bus, device, function, offset & !3);
+
     let shift = ((offset & 3) * 8) as u32;
+
     ((value >> shift) & 0xFF) as u8
 }
 
@@ -242,6 +261,62 @@ fn pci_command(bus: u8, device: u8, function: u8) -> u16 {
 #[inline(always)]
 fn pci_status(bus: u8, device: u8, function: u8) -> u16 {
     read_u16(bus, device, function, PCI_STATUS)
+}
+
+// ============================================================
+// Preferred-controller check
+// ============================================================
+
+#[inline]
+fn is_preferred_xhci(vendor_id: u16, device_id: u16) -> bool {
+    PREFERRED_XHCI_CONTROLLERS
+        .iter()
+        .any(|&(preferred_vendor, preferred_device)| {
+            preferred_vendor == vendor_id && preferred_device == device_id
+        })
+}
+
+// ============================================================
+// Print controller identification
+// ============================================================
+
+fn log_xhci_identity(
+    bus: u8,
+    device: u8,
+    function: u8,
+    vendor_id: u16,
+    device_id: u16,
+    revision_id: u8,
+) {
+    serial::write_str("PCI: xHCI controller found during scan\n");
+
+    serial::write_str("PCI: BDF=");
+
+    serial::write_usize(bus as usize);
+
+    serial::write_str(":");
+
+    serial::write_usize(device as usize);
+
+    serial::write_str(".");
+
+    serial::write_usize(function as usize);
+
+    serial::write_str("\n");
+
+    serial::write_str("PCI: vendor=");
+
+    serial::write_hex(vendor_id as u64);
+
+    serial::write_str(" device=");
+
+    serial::write_hex(device_id as u64);
+
+    serial::write_str(" revision=");
+
+    serial::write_hex(revision_id as u64);
+
+    serial::write_str("\n");
 }
 
 // ============================================================
@@ -269,6 +344,7 @@ fn find_capability(bus: u8, device: u8, function: u8, cap_id: u8) -> Option<u8> 
         }
 
         let id = read_u8(bus, device, function, ptr);
+
         if id == cap_id {
             return Some(ptr);
         }
@@ -289,6 +365,7 @@ fn read_bar(bus: u8, device: u8, function: u8, bar_index: u8) -> Option<u64> {
     }
 
     let offset = PCI_BAR0.checked_add(bar_index.checked_mul(4)?)?;
+
     let low = read_u32(bus, device, function, offset);
 
     if low == 0 || low == 0xFFFF_FFFF {
@@ -307,21 +384,14 @@ fn read_bar(bus: u8, device: u8, function: u8, bar_index: u8) -> Option<u64> {
         }
 
         let high = read_u32(bus, device, function, offset + 4);
+
         let address = ((high as u64) << 32) | ((low as u64) & PCI_BAR_MEMORY_ADDRESS_MASK as u64);
 
-        if address == 0 {
-            None
-        } else {
-            Some(address)
-        }
+        if address == 0 { None } else { Some(address) }
     } else {
         let address = (low & PCI_BAR_MEMORY_ADDRESS_MASK) as u64;
 
-        if address == 0 {
-            None
-        } else {
-            Some(address)
-        }
+        if address == 0 { None } else { Some(address) }
     }
 }
 
@@ -331,6 +401,7 @@ fn read_bar_size(bus: u8, device: u8, function: u8, bar_index: u8) -> Option<u64
     }
 
     let offset = PCI_BAR0.checked_add(bar_index.checked_mul(4)?)?;
+
     let original_low = read_u32(bus, device, function, offset);
 
     if original_low == 0xFFFF_FFFF || original_low & PCI_BAR_IO_SPACE != 0 {
@@ -343,12 +414,14 @@ fn read_bar_size(bus: u8, device: u8, function: u8, bar_index: u8) -> Option<u64
         if bar_index as usize + 1 >= PCI_MAX_BARS {
             return None;
         }
+
         read_u32(bus, device, function, offset + 4)
     } else {
         0
     };
 
     let original_command = pci_command(bus, device, function);
+
     let disabled_command = original_command & !(PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER);
 
     if disabled_command != original_command {
@@ -356,18 +429,23 @@ fn read_bar_size(bus: u8, device: u8, function: u8, bar_index: u8) -> Option<u64
     }
 
     write_u32(bus, device, function, offset, 0xFFFF_FFFF);
+
     let size_low = read_u32(bus, device, function, offset);
 
     let size_high = if is_64_bit {
         write_u32(bus, device, function, offset + 4, 0xFFFF_FFFF);
+
         let value = read_u32(bus, device, function, offset + 4);
+
         write_u32(bus, device, function, offset + 4, original_high);
+
         value
     } else {
         0
     };
 
     write_u32(bus, device, function, offset, original_low);
+
     write_u16(bus, device, function, PCI_COMMAND, original_command);
 
     let mask = if is_64_bit {
@@ -405,7 +483,9 @@ fn enable_controller(bus: u8, device: u8, function: u8) {
     let command = pci_command(bus, device, function);
 
     serial::write_str("PCI: COMMAND before=");
+
     serial::write_hex(command as u64);
+
     serial::write_str("\n");
 
     let new_command = command | PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
@@ -417,7 +497,9 @@ fn enable_controller(bus: u8, device: u8, function: u8) {
     let verified = pci_command(bus, device, function);
 
     serial::write_str("PCI: COMMAND after=");
+
     serial::write_hex(verified as u64);
+
     serial::write_str("\n");
 
     if verified & PCI_COMMAND_MEMORY_SPACE == 0 {
@@ -431,10 +513,17 @@ fn enable_controller(bus: u8, device: u8, function: u8) {
 
 fn disable_legacy_intx(device: &XhciPciDevice) {
     let command = pci_command(device.bus, device.device, device.function);
+
     let new_command = command | PCI_COMMAND_INTERRUPT_DISABLE;
 
     if new_command != command {
-        write_u16(device.bus, device.device, device.function, PCI_COMMAND, new_command);
+        write_u16(
+            device.bus,
+            device.device,
+            device.function,
+            PCI_COMMAND,
+            new_command,
+        );
     }
 }
 
@@ -461,31 +550,49 @@ fn debug_dump_capabilities(device: &XhciPciDevice) {
 
     if let Some(offset) = device.msi_offset {
         serial::write_str("PCI: MSI capability offset=");
+
         serial::write_hex(offset as u64);
+
         serial::write_str("\n");
     }
 
     if let Some(offset) = device.msix_offset {
         serial::write_str("PCI: MSI-X capability offset=");
+
         serial::write_hex(offset as u64);
+
         serial::write_str("\n");
 
         let control = read_u16(device.bus, device.device, device.function, offset + 0x02);
+
         let table = read_u32(device.bus, device.device, device.function, offset + 0x04);
+
         let pba = read_u32(device.bus, device.device, device.function, offset + 0x08);
 
         serial::write_str("PCI: MSI-X control=");
+
         serial::write_hex(control as u64);
+
         serial::write_str(" table_size=");
+
         serial::write_usize(((control & MSIX_CONTROL_TABLE_SIZE_MASK) as usize) + 1);
+
         serial::write_str(" table_bir=");
+
         serial::write_hex((table & MSIX_BIR_MASK) as u64);
+
         serial::write_str(" table_offset=");
+
         serial::write_hex((table & MSIX_TABLE_OFFSET_MASK) as u64);
+
         serial::write_str(" pba_bir=");
+
         serial::write_hex((pba & MSIX_BIR_MASK) as u64);
+
         serial::write_str(" pba_offset=");
+
         serial::write_hex((pba & MSIX_TABLE_OFFSET_MASK) as u64);
+
         serial::write_str("\n");
     }
 }
@@ -498,13 +605,17 @@ fn msix_table_info(device: &XhciPciDevice) -> Option<(u8, u64, usize, u16)> {
     let cap = device.msix_offset?;
 
     let control = read_u16(device.bus, device.device, device.function, cap + 0x02);
+
     let entry_count = (control & MSIX_CONTROL_TABLE_SIZE_MASK) + 1;
+
     if entry_count == 0 {
         return None;
     }
 
     let table = read_u32(device.bus, device.device, device.function, cap + 0x04);
+
     let bir = (table & MSIX_BIR_MASK) as u8;
+
     let offset = (table & MSIX_TABLE_OFFSET_MASK) as u64;
 
     if bir as usize >= PCI_MAX_BARS {
@@ -523,16 +634,19 @@ fn msix_table_info(device: &XhciPciDevice) -> Option<(u8, u64, usize, u16)> {
      */
     if (offset & 0x7) != 0 {
         serial::write_str("PCI: ERROR: MSI-X table offset is not 8-byte aligned\n");
+
         return None;
     }
 
     let table_bytes = (entry_count as usize).checked_mul(MSIX_TABLE_ENTRY_SIZE)?;
+
     let table_end = offset.checked_add(table_bytes as u64)?;
 
     let bar_size = read_bar_size(device.bus, device.device, device.function, bir)?;
 
     if table_end > bar_size {
         serial::write_str("PCI: ERROR: MSI-X table extends beyond its BAR\n");
+
         return None;
     }
 
@@ -552,6 +666,7 @@ fn setup_msix(device: &XhciPciDevice, vector: u8) -> bool {
 
     let Some((table_bar, table_address, table_bytes, entry_count)) = msix_table_info(device) else {
         serial::write_str("PCI: ERROR: unable to decode MSI-X table\n");
+
         return false;
     };
 
@@ -560,13 +675,21 @@ fn setup_msix(device: &XhciPciDevice, vector: u8) -> bool {
     }
 
     serial::write_str("PCI: MSI-X table BAR=");
+
     serial::write_hex(table_bar as u64);
+
     serial::write_str(" address=");
+
     serial::write_hex(table_address);
+
     serial::write_str(" bytes=");
+
     serial::write_hex(table_bytes as u64);
+
     serial::write_str(" entries=");
+
     serial::write_usize(entry_count as usize);
+
     serial::write_str("\n");
 
     // The table is ordinary MMIO memory inside the BAR identified by BIR.
@@ -577,22 +700,33 @@ fn setup_msix(device: &XhciPciDevice, vector: u8) -> bool {
     }
 
     let table_virtual = table_address as usize;
+
     let entry = table_virtual;
 
     let (message_address, message_data) = match interrupts::msi_message(vector) {
         Some(value) => value,
+
         None => {
             serial::write_str("PCI: ERROR: unable to compose x86 MSI message\n");
+
             return false;
         }
     };
 
     // Disable MSI-X and assert Function Mask while programming the table.
     let mut control = read_u16(device.bus, device.device, device.function, cap + 0x02);
+
     control &= !MSIX_CONTROL_ENABLE;
+
     control |= MSIX_CONTROL_FUNCTION_MASK;
 
-    write_u16(device.bus, device.device, device.function, cap + 0x02, control);
+    write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        cap + 0x02,
+        control,
+    );
 
     unsafe {
         /*
@@ -609,7 +743,10 @@ fn setup_msix(device: &XhciPciDevice, vector: u8) -> bool {
                 )
                 .expect("PCI: MSI-X table entry address overflow");
 
-            write_volatile((entry_address + 0x0C) as *mut u32, MSIX_TABLE_VECTOR_CONTROL_MASK);
+            write_volatile(
+                (entry_address + 0x0C) as *mut u32,
+                MSIX_TABLE_VECTOR_CONTROL_MASK,
+            );
         }
 
         /*
@@ -617,12 +754,14 @@ fn setup_msix(device: &XhciPciDevice, vector: u8) -> bool {
          * corresponds to MSI-X table entry 0.
          */
         write_volatile((entry + 0x00) as *mut u32, message_address as u32);
+
         write_volatile((entry + 0x04) as *mut u32, (message_address >> 32) as u32);
+
         write_volatile((entry + 0x08) as *mut u32, message_data as u32);
 
         /*
-         * Vector Control bit 0 = Mask. Clear it only after the message fields
-         * have been written.
+         * Vector Control bit 0 = Mask.
+         * Clear it only after the message fields have been written.
          */
         write_volatile((entry + 0x0C) as *mut u32, 0);
     }
@@ -632,24 +771,35 @@ fn setup_msix(device: &XhciPciDevice, vector: u8) -> bool {
 
     // Clear Function Mask and enable MSI-X.
     control &= !MSIX_CONTROL_FUNCTION_MASK;
+
     control |= MSIX_CONTROL_ENABLE;
 
-    write_u16(device.bus, device.device, device.function, cap + 0x02, control);
+    write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        cap + 0x02,
+        control,
+    );
 
     let verified = read_u16(device.bus, device.device, device.function, cap + 0x02);
 
     if verified & MSIX_CONTROL_ENABLE == 0 {
         serial::write_str("PCI: ERROR: xHCI MSI-X failed to enable\n");
+
         return false;
     }
 
     if verified & MSIX_CONTROL_FUNCTION_MASK != 0 {
         serial::write_str("PCI: ERROR: xHCI MSI-X Function Mask remained set\n");
+
         return false;
     }
 
     serial::write_str("PCI: MSI-X enabled for xHCI, vector=");
+
     serial::write_usize(vector as usize);
+
     serial::write_str(" table_entry=0\n");
 
     true
@@ -665,9 +815,18 @@ fn disable_msix(device: &XhciPciDevice) {
     };
 
     let mut control = read_u16(device.bus, device.device, device.function, cap + 0x02);
+
     control &= !MSIX_CONTROL_ENABLE;
+
     control |= MSIX_CONTROL_FUNCTION_MASK;
-    write_u16(device.bus, device.device, device.function, cap + 0x02, control);
+
+    write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        cap + 0x02,
+        control,
+    );
 }
 
 // ============================================================
@@ -677,6 +836,7 @@ fn disable_msix(device: &XhciPciDevice) {
 pub fn setup_msi(device: &XhciPciDevice, vector: u8) -> bool {
     let Some(cap) = device.msi_offset else {
         serial::write_str("PCI: xHCI has no MSI capability\n");
+
         return false;
     };
 
@@ -684,14 +844,22 @@ pub fn setup_msi(device: &XhciPciDevice, vector: u8) -> bool {
 
     let mut control = read_u16(device.bus, device.device, device.function, cap + 0x02);
 
-    // Program one MSI message.  MME=000 requests exactly one message.
+    // Program one MSI message. MME=000 requests exactly one message.
     control &= !MSI_CONTROL_ENABLE;
+
     control &= !MSI_CONTROL_MME_MASK;
 
-    write_u16(device.bus, device.device, device.function, cap + 0x02, control);
+    write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        cap + 0x02,
+        control,
+    );
 
     let Some((message_address, message_data)) = interrupts::msi_message(vector) else {
         serial::write_str("PCI: ERROR: unable to compose x86 MSI message\n");
+
         return false;
     };
 
@@ -711,6 +879,7 @@ pub fn setup_msi(device: &XhciPciDevice, vector: u8) -> bool {
             cap + 0x08,
             (message_address >> 32) as u32,
         );
+
         cap + 0x0C
     } else {
         // 32-bit MSI has no upper-address dword.
@@ -725,39 +894,48 @@ pub fn setup_msi(device: &XhciPciDevice, vector: u8) -> bool {
         message_data,
     );
 
-    // If per-vector masking is implemented, unmask message 0.  The optional
-    // MSI Mask Bits register has a fixed capability-relative location:
+    // If per-vector masking is implemented, unmask message 0.
+    //
+    // The optional MSI Mask Bits register has a fixed capability-relative
+    // location:
+    //
     //   32-bit MSI -> +0x0C
     //   64-bit MSI -> +0x10
+    //
     if control & MSI_CONTROL_MASK_CAPABLE != 0 {
         let mask_offset = if control & MSI_CONTROL_64BIT != 0 {
             cap + 0x10
         } else {
             cap + 0x0C
         };
-        write_u32(
-            device.bus,
-            device.device,
-            device.function,
-            mask_offset,
-            0,
-        );
+
+        write_u32(device.bus, device.device, device.function, mask_offset, 0);
     }
 
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
     control |= MSI_CONTROL_ENABLE;
-    write_u16(device.bus, device.device, device.function, cap + 0x02, control);
+
+    write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        cap + 0x02,
+        control,
+    );
 
     let verified = read_u16(device.bus, device.device, device.function, cap + 0x02);
 
     if verified & MSI_CONTROL_ENABLE == 0 {
         serial::write_str("PCI: ERROR: xHCI MSI failed to enable\n");
+
         return false;
     }
 
     serial::write_str("PCI: MSI enabled for xHCI, vector=");
+
     serial::write_usize(vector as usize);
+
     serial::write_str("\n");
 
     true
@@ -773,8 +951,16 @@ fn disable_msi(device: &XhciPciDevice) {
     };
 
     let mut control = read_u16(device.bus, device.device, device.function, cap + 0x02);
+
     control &= !MSI_CONTROL_ENABLE;
-    write_u16(device.bus, device.device, device.function, cap + 0x02, control);
+
+    write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        cap + 0x02,
+        control,
+    );
 }
 
 // ============================================================
@@ -783,7 +969,9 @@ fn disable_msi(device: &XhciPciDevice) {
 
 pub fn setup_interrupts(device: &XhciPciDevice, vector: u8) -> XhciInterruptMode {
     serial::write_str("PCI: configuring xHCI interrupts, vector=");
+
     serial::write_usize(vector as usize);
+
     serial::write_str("\n");
 
     /*
@@ -798,39 +986,275 @@ pub fn setup_interrupts(device: &XhciPciDevice, vector: u8) -> XhciInterruptMode
     // enough for now while retaining a path to multiple vectors later.
     if device.msix_offset.is_some() {
         serial::write_str("PCI: trying MSI-X first\n");
+
         if setup_msix(device, vector) {
             disable_msi(device);
+
             disable_legacy_intx(device);
+
             return XhciInterruptMode::Msix;
         }
 
         serial::write_str("PCI: MSI-X setup failed; falling back to MSI\n");
+
         disable_msix(device);
     }
 
     if device.msi_offset.is_some() {
         serial::write_str("PCI: trying MSI\n");
+
         if setup_msi(device, vector) {
             disable_legacy_intx(device);
+
             return XhciInterruptMode::Msi;
         }
     }
 
     serial::write_str("PCI: ERROR: xHCI has no usable MSI/MSI-X interrupt mode\n");
+
     XhciInterruptMode::Disabled
+}
+
+// ============================================================
+// Build xHCI PCI device information
+// ============================================================
+//
+// This performs all non-destructive PCI inspection necessary to create
+// XhciPciDevice.
+//
+// The controller is NOT enabled here.
+//
+// That is important because find_xhci() may discover several xHCI
+// controllers and must not initialize every controller while deciding
+// which one to use.
+//
+// ============================================================
+
+fn inspect_xhci(
+    bus: u8,
+    device: u8,
+    function: u8,
+    vendor_id: u16,
+    device_id: u16,
+    revision_id: u8,
+) -> Option<XhciPciDevice> {
+    let bar0 = match read_bar0(bus, device, function) {
+        Some(value) => value,
+
+        None => {
+            serial::write_str("PCI: ERROR: xHCI BAR0 is invalid\n");
+
+            return None;
+        }
+    };
+
+    let bar0_size = match read_bar0_size(bus, device, function) {
+        Some(value) => value,
+
+        None => {
+            serial::write_str("PCI: ERROR: unable to determine xHCI BAR0 size\n");
+
+            return None;
+        }
+    };
+
+    serial::write_str("PCI: BAR0=");
+
+    serial::write_hex(bar0);
+
+    serial::write_str(" size=");
+
+    serial::write_hex(bar0_size);
+
+    serial::write_str("\n");
+
+    let msi_offset = find_capability(bus, device, function, PCI_CAP_ID_MSI);
+
+    let msix_offset = find_capability(bus, device, function, PCI_CAP_ID_MSIX);
+
+    Some(XhciPciDevice {
+        bus,
+        device,
+        function,
+
+        vendor_id,
+        device_id,
+        revision_id,
+
+        bar0,
+        bar0_size,
+
+        msi_offset,
+        msix_offset,
+
+        interrupt_mode: XhciInterruptMode::Disabled,
+
+        interrupt_vector: interrupts::XHCI_INTERRUPT_VECTOR,
+
+        msix_table_bar: None,
+
+        msix_table_offset: None,
+
+        msix_table_size: None,
+    })
+}
+
+// ============================================================
+// Configure selected xHCI controller
+// ============================================================
+//
+// At this point the controller has already been selected.
+//
+// Only the selected controller gets:
+//
+//   - capability diagnostics
+//   - PCI Memory Space enable
+//   - PCI Bus Master enable
+//   - MSI-X/MSI setup
+//
+// ============================================================
+
+fn configure_selected_xhci(mut xhci: XhciPciDevice) -> XhciPciDevice {
+    serial::write_str("PCI: configuring selected xHCI controller\n");
+
+    serial::write_str("PCI: selected BDF=");
+
+    serial::write_usize(xhci.bus as usize);
+
+    serial::write_str(":");
+
+    serial::write_usize(xhci.device as usize);
+
+    serial::write_str(".");
+
+    serial::write_usize(xhci.function as usize);
+
+    serial::write_str("\n");
+
+    serial::write_str("PCI: selected vendor=");
+
+    serial::write_hex(xhci.vendor_id as u64);
+
+    serial::write_str(" device=");
+
+    serial::write_hex(xhci.device_id as u64);
+
+    serial::write_str("\n");
+
+    debug_dump_capabilities(&xhci);
+
+    // Enable MMIO decoding + bus mastering before controller use.
+    enable_controller(xhci.bus, xhci.device, xhci.function);
+
+    // Configure MSI-X/MSI before xHCI RUN is asserted. The xHCI driver itself
+    // enables USBCMD.EIE + IMAN.IE later in run().
+    xhci.interrupt_mode = setup_interrupts(&xhci, interrupts::XHCI_INTERRUPT_VECTOR);
+
+    if let Some(cap) = xhci.msix_offset {
+        let control = read_u16(xhci.bus, xhci.device, xhci.function, cap + 0x02);
+
+        if control & MSIX_CONTROL_ENABLE != 0 {
+            let table = read_u32(xhci.bus, xhci.device, xhci.function, cap + 0x04);
+
+            let bir = (table & MSIX_BIR_MASK) as u8;
+
+            let offset = (table & MSIX_TABLE_OFFSET_MASK) as u32;
+
+            let count = (control & MSIX_CONTROL_TABLE_SIZE_MASK) + 1;
+
+            xhci.msix_table_bar = Some(bir);
+
+            xhci.msix_table_offset = Some(offset);
+
+            xhci.msix_table_size = Some(count);
+        }
+    }
+
+    serial::write_str("PCI: xHCI interrupt mode=");
+
+    match xhci.interrupt_mode {
+        XhciInterruptMode::Msix => serial::write_str("MSI-X"),
+
+        XhciInterruptMode::Msi => serial::write_str("MSI"),
+
+        XhciInterruptMode::Disabled => serial::write_str("DISABLED"),
+    }
+
+    serial::write_str(" vector=");
+
+    serial::write_usize(xhci.interrupt_vector as usize);
+
+    serial::write_str("\n");
+
+    let command = pci_command(xhci.bus, xhci.device, xhci.function);
+
+    let status = pci_status(xhci.bus, xhci.device, xhci.function);
+
+    serial::write_str("PCI: final COMMAND=");
+
+    serial::write_hex(command as u64);
+
+    serial::write_str(" STATUS=");
+
+    serial::write_hex(status as u64);
+
+    serial::write_str("\n");
+
+    xhci
 }
 
 // ============================================================
 // Scan PCI bus for xHCI
 // ============================================================
+//
+// Selection policy:
+//
+//   1. Scan all PCI buses/devices/functions.
+//
+//   2. Every PCI function matching:
+//
+//        Class    = 0x0C
+//        Subclass = 0x03
+//        ProgIF   = 0x30
+//
+//      is an xHCI controller.
+//
+//   3. The first valid xHCI controller is saved as a fallback.
+//
+//   4. If a controller matches PREFERRED_XHCI_CONTROLLERS,
+//      it is selected immediately.
+//
+//   5. If no preferred controller was found after the complete scan,
+//      the first valid xHCI controller is selected.
+//
+// This means a vendor/device ID not present in the preferred list
+// is still fully supported.
+//
+// ============================================================
 
 pub fn find_xhci() -> Option<XhciPciDevice> {
-    serial::write_str("PCI: DEBUGGING MODE: only selecting 8086:51ED xHCI controller\n");
-    serial::write_str("PCI: DEBUGGING MODE: 8086:461E and all other xHCI controllers will be skipped\n");
+    serial::write_str("PCI: scanning for xHCI controllers\n");
+
+    serial::write_str("PCI: preferred xHCI controller list:\n");
+
+    for &(vendor_id, device_id) in PREFERRED_XHCI_CONTROLLERS.iter() {
+        serial::write_str("PCI:   ");
+
+        serial::write_hex(vendor_id as u64);
+
+        serial::write_str(":");
+
+        serial::write_hex(device_id as u64);
+
+        serial::write_str("\n");
+    }
+
+    let mut first_xhci: Option<XhciPciDevice> = None;
 
     for bus in 0..=255u16 {
         for device in 0..32u8 {
             let bus8 = bus as u8;
+
             let vendor0 = read_u16(bus8, device, 0, PCI_VENDOR_ID);
 
             if vendor0 == 0xFFFF {
@@ -838,10 +1262,12 @@ pub fn find_xhci() -> Option<XhciPciDevice> {
             }
 
             let header_type = read_u8(bus8, device, 0, PCI_HEADER_TYPE);
+
             let function_count = if header_type & 0x80 != 0 { 8 } else { 1 };
 
             for function_index in 0..function_count {
                 let function = function_index as u8;
+
                 let vendor_id = read_u16(bus8, device, function, PCI_VENDOR_ID);
 
                 if vendor_id == 0xFFFF {
@@ -849,11 +1275,16 @@ pub fn find_xhci() -> Option<XhciPciDevice> {
                 }
 
                 let device_id = read_u16(bus8, device, function, PCI_DEVICE_ID);
+
                 let revision_id = read_u8(bus8, device, function, PCI_REVISION_ID);
+
                 let prog_if = read_u8(bus8, device, function, PCI_PROG_IF);
+
                 let subclass = read_u8(bus8, device, function, PCI_SUBCLASS);
+
                 let class = read_u8(bus8, device, function, PCI_CLASS);
 
+                // Not an xHCI controller.
                 if class != PCI_CLASS_SERIAL_BUS
                     || subclass != PCI_SUBCLASS_USB
                     || prog_if != PCI_PROGIF_XHCI
@@ -861,126 +1292,62 @@ pub fn find_xhci() -> Option<XhciPciDevice> {
                     continue;
                 }
 
-                serial::write_str("PCI: xHCI controller found during scan\n");
-                serial::write_str("PCI: BDF=");
-                serial::write_usize(bus as usize);
-                serial::write_str(":");
-                serial::write_usize(device as usize);
-                serial::write_str(".");
-                serial::write_usize(function as usize);
-                serial::write_str("\n");
+                log_xhci_identity(bus8, device, function, vendor_id, device_id, revision_id);
 
-                serial::write_str("PCI: vendor=");
-                serial::write_hex(vendor_id as u64);
-                serial::write_str(" device=");
-                serial::write_hex(device_id as u64);
-                serial::write_str(" revision=");
-                serial::write_hex(revision_id as u64);
-                serial::write_str("\n");
+                let is_preferred = is_preferred_xhci(vendor_id, device_id);
 
-                if DEBUG_XHCI_ONLY
-                    && (vendor_id != DEBUG_XHCI_VENDOR_ID || device_id != DEBUG_XHCI_DEVICE_ID)
-                {
-                    serial::write_str("PCI: DEBUGGING MODE: skipping xHCI controller\n");
+                if is_preferred {
+                    serial::write_str("PCI: xHCI matches preferred controller list\n");
+                } else {
+                    serial::write_str("PCI: xHCI is not on preferred list\n");
+
+                    serial::write_str(
+                        "PCI: xHCI will be used as fallback if no preferred controller is found\n",
+                    );
+                }
+
+                let Some(xhci) =
+                    inspect_xhci(bus8, device, function, vendor_id, device_id, revision_id)
+                else {
+                    serial::write_str(
+                        "PCI: xHCI controller is not usable as a fallback because PCI resources are invalid\n",
+                    );
+
                     continue;
-                }
-
-                serial::write_str("PCI: DEBUGGING MODE: selected Intel 8086:51ED xHCI controller\n");
-
-                let bar0 = match read_bar0(bus8, device, function) {
-                    Some(value) => value,
-                    None => {
-                        serial::write_str("PCI: ERROR: xHCI BAR0 is invalid\n");
-                        continue;
-                    }
                 };
 
-                let bar0_size = match read_bar0_size(bus8, device, function) {
-                    Some(value) => value,
-                    None => {
-                        serial::write_str("PCI: ERROR: unable to determine xHCI BAR0 size\n");
-                        continue;
-                    }
-                };
+                // Remember the FIRST valid xHCI controller.
+                //
+                // This is deliberately only assigned once so scan order
+                // determines the fallback controller.
+                if first_xhci.is_none() {
+                    serial::write_str("PCI: saving this controller as first xHCI fallback\n");
 
-                serial::write_str("PCI: BAR0=");
-                serial::write_hex(bar0);
-                serial::write_str(" size=");
-                serial::write_hex(bar0_size);
-                serial::write_str("\n");
-
-                let msi_offset = find_capability(bus8, device, function, PCI_CAP_ID_MSI);
-                let msix_offset = find_capability(bus8, device, function, PCI_CAP_ID_MSIX);
-
-                let mut xhci = XhciPciDevice {
-                    bus: bus8,
-                    device,
-                    function,
-                    vendor_id,
-                    device_id,
-                    revision_id,
-                    bar0,
-                    bar0_size,
-                    msi_offset,
-                    msix_offset,
-                    interrupt_mode: XhciInterruptMode::Disabled,
-                    interrupt_vector: interrupts::XHCI_INTERRUPT_VECTOR,
-                    msix_table_bar: None,
-                    msix_table_offset: None,
-                    msix_table_size: None,
-                };
-
-                debug_dump_capabilities(&xhci);
-
-                // Enable MMIO decoding + bus mastering before controller use.
-                enable_controller(bus8, device, function);
-
-                // Configure MSI-X/MSI before xHCI RUN is asserted.  The xHCI
-                // driver itself enables USBCMD.EIE + IMAN.IE later in run().
-                xhci.interrupt_mode = setup_interrupts(
-                    &xhci,
-                    interrupts::XHCI_INTERRUPT_VECTOR,
-                );
-
-                if let Some(cap) = xhci.msix_offset {
-                    let control = read_u16(bus8, device, function, cap + 0x02);
-                    if control & MSIX_CONTROL_ENABLE != 0 {
-                        let table = read_u32(bus8, device, function, cap + 0x04);
-                        let bir = (table & MSIX_BIR_MASK) as u8;
-                        let offset = (table & MSIX_TABLE_OFFSET_MASK) as u32;
-                        let count = (control & MSIX_CONTROL_TABLE_SIZE_MASK) + 1;
-                        xhci.msix_table_bar = Some(bir);
-                        xhci.msix_table_offset = Some(offset);
-                        xhci.msix_table_size = Some(count);
-                    }
+                    first_xhci = Some(xhci);
                 }
 
-                serial::write_str("PCI: xHCI interrupt mode=");
-                match xhci.interrupt_mode {
-                    XhciInterruptMode::Msix => serial::write_str("MSI-X"),
-                    XhciInterruptMode::Msi => serial::write_str("MSI"),
-                    XhciInterruptMode::Disabled => serial::write_str("DISABLED"),
+                // Preferred controller wins immediately.
+                if is_preferred {
+                    serial::write_str("PCI: selecting preferred xHCI controller\n");
+
+                    return Some(configure_selected_xhci(xhci));
                 }
-                serial::write_str(" vector=");
-                serial::write_usize(xhci.interrupt_vector as usize);
-                serial::write_str("\n");
-
-                let command = pci_command(bus8, device, function);
-                let status = pci_status(bus8, device, function);
-
-                serial::write_str("PCI: final COMMAND=");
-                serial::write_hex(command as u64);
-                serial::write_str(" STATUS=");
-                serial::write_hex(status as u64);
-                serial::write_str("\n");
-
-                return Some(xhci);
             }
         }
     }
 
-    serial::write_str("PCI: DEBUGGING MODE: 8086:51ED xHCI controller was not found\n");
-    serial::write_str("PCI: no selected xHCI controller available\n");
+    // No preferred controller was found.
+    //
+    // Fall back to the first valid xHCI discovered during the scan.
+    if let Some(xhci) = first_xhci {
+        serial::write_str("PCI: no preferred xHCI controller found\n");
+
+        serial::write_str("PCI: selecting FIRST discovered xHCI controller as fallback\n");
+
+        return Some(configure_selected_xhci(xhci));
+    }
+
+    serial::write_str("PCI: no xHCI controller found\n");
 
     None
 }
@@ -993,92 +1360,162 @@ pub fn debug_dump_ports(mmio_base: usize) {
     serial::write_str("xHCI: PORT DUMP BEGIN\n");
 
     let cap_length = unsafe { read_volatile((mmio_base + 0x00) as *const u8) } as usize;
+
     let op_base = mmio_base + cap_length;
 
     let hcsparams1 = unsafe { read_volatile((mmio_base + 0x04) as *const u32) };
+
     let hccparams1 = unsafe { read_volatile((mmio_base + 0x10) as *const u32) };
+
     let usbcmd = unsafe { read_volatile((op_base + 0x00) as *const u32) };
+
     let usbsts = unsafe { read_volatile((op_base + 0x04) as *const u32) };
+
     let pagesize = unsafe { read_volatile((op_base + 0x08) as *const u32) };
 
     let max_slots = (hcsparams1 & 0xFF) as usize;
+
     let max_interrupters = ((hcsparams1 >> 8) & 0x7FF) as usize;
+
     let max_ports = ((hcsparams1 >> 24) & 0xFF) as usize;
+
     let supports_64bit = (hccparams1 & 1) != 0;
+
     let context_size_64 = (hccparams1 & (1 << 2)) != 0;
+
     let xecp = (hccparams1 >> 16) as u16;
 
     serial::write_str("xHCI: BASE=");
+
     serial::write_hex(mmio_base as u64);
+
     serial::write_str(" CAP=");
+
     serial::write_hex(cap_length as u64);
+
     serial::write_str(" OP=");
+
     serial::write_hex(op_base as u64);
+
     serial::write_str("\n");
 
     serial::write_str("xHCI: SLOTS=");
+
     serial::write_usize(max_slots);
+
     serial::write_str(" INTERRUPTERS=");
+
     serial::write_usize(max_interrupters);
+
     serial::write_str(" PORTS=");
+
     serial::write_usize(max_ports);
+
     serial::write_str("\n");
 
     serial::write_str("xHCI: HCCPARAMS1=");
+
     serial::write_hex(hccparams1 as u64);
+
     serial::write_str(" AC64=");
+
     serial::write_usize(supports_64bit as usize);
+
     serial::write_str(" CSZ64=");
+
     serial::write_usize(context_size_64 as usize);
+
     serial::write_str(" XECP=");
+
     serial::write_hex(xecp as u64);
+
     serial::write_str("\n");
 
     serial::write_str("xHCI: USBCMD=");
+
     serial::write_hex(usbcmd as u64);
+
     serial::write_str(" USBSTS=");
+
     serial::write_hex(usbsts as u64);
+
     serial::write_str(" PAGESIZE=");
+
     serial::write_hex(pagesize as u64);
+
     serial::write_str("\n");
 
     for port_index in 0..max_ports {
         let address = op_base + 0x400 + (port_index * 0x10);
+
         let portsc = unsafe { read_volatile(address as *const u32) };
+
         let portpmsc = unsafe { read_volatile((address + 0x04) as *const u32) };
+
         let portli = unsafe { read_volatile((address + 0x08) as *const u32) };
+
         let porthlpmc = unsafe { read_volatile((address + 0x0C) as *const u32) };
 
         serial::write_str("xHCI: P");
+
         serial::write_usize(port_index + 1);
+
         serial::write_str(" SC=");
+
         serial::write_hex(portsc as u64);
+
         serial::write_str(" PMSC=");
+
         serial::write_hex(portpmsc as u64);
+
         serial::write_str(" LI=");
+
         serial::write_hex(portli as u64);
+
         serial::write_str(" HLPMC=");
+
         serial::write_hex(porthlpmc as u64);
+
         serial::write_str(" CCS=");
+
         serial::write_usize((portsc & 1) as usize);
+
         serial::write_str(" PED=");
+
         serial::write_usize(((portsc >> 1) & 1) as usize);
+
         serial::write_str(" PR=");
+
         serial::write_usize(((portsc >> 4) & 1) as usize);
+
         serial::write_str(" PLS=");
+
         serial::write_hex(((portsc >> 5) & 0xF) as u64);
+
         serial::write_str(" PP=");
+
         serial::write_usize(((portsc >> 9) & 1) as usize);
+
         serial::write_str(" SPEED=");
+
         serial::write_hex(((portsc >> 10) & 0xF) as u64);
+
         serial::write_str(" CSC=");
+
         serial::write_usize(((portsc >> 17) & 1) as usize);
+
         serial::write_str(" PEC=");
+
         serial::write_usize(((portsc >> 18) & 1) as usize);
+
         serial::write_str(" PRC=");
+
         serial::write_usize(((portsc >> 21) & 1) as usize);
+
         serial::write_str(" PLC=");
+
         serial::write_usize(((portsc >> 22) & 1) as usize);
+
         serial::write_str("\n");
     }
 

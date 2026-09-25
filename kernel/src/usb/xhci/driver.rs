@@ -55,6 +55,8 @@ const USBCMD_HSEE: u32 = 1 << 3;
 
 const IMAN_IP: u32 = 1 << 0;
 
+const IMAN_IE: u32 = 1 << 1;
+
 /*
  * ==========================================================================
  * xHCI PORTSC
@@ -1712,10 +1714,6 @@ impl XhciDriver {
 
         self.regs.set_crcr(crcr);
 
-        /* Flush the posted CRCR write before programming the dependent
-         * controller structures. */
-        let _ = self.regs.crcr();
-
         /*
          * ==================================================================
          * 6. Set DCBAAP.
@@ -1729,9 +1727,6 @@ impl XhciDriver {
         }
 
         self.regs.set_dcbaap(self.dcbaa_phys);
-
-        /* Flush the posted DCBAAP write. */
-        let _ = self.regs.dcbaap();
 
         /*
          * ==================================================================
@@ -2132,10 +2127,11 @@ impl XhciDriver {
         self.regs.set_usbsts(USBSTS_EINT);
 
         /*
-         * Use the register helper for the Linux-style interrupter RMW:
-         * preserve the interrupter state, clear IMAN.IP, then set IMAN.IE.
+         * IMAN.IP is RW1C. Writing zero does NOT clear it.
+         * Write the intended interrupter state explicitly: IE=1 and IP=1
+         * to clear any stale pending interrupt while enabling IE.
          */
-        self.regs.enable_interrupter(0);
+        self.regs.set_iman(0, IMAN_IE | IMAN_IP);
 
         /*
          * Flush posted MMIO write.
@@ -3307,7 +3303,7 @@ impl XhciDriver {
 
         if (iman & IMAN_IP) != 0 || (usbsts & USBSTS_EINT) != 0 {
             self.regs.set_usbsts(USBSTS_EINT);
-            self.regs.enable_interrupter(0);
+            self.regs.set_iman(0, IMAN_IE | IMAN_IP);
         }
     }
 

@@ -1,31 +1,16 @@
 // ============================================================
-// Rusty USB polling
+// Rusty custom USB polling
 // ============================================================
 //
-// The xHCI IDT handler in interrupts.rs deliberately does NOT process the
-// xHCI event ring. It only:
+// This is the normal-context side of the xHCI MSI/MSI-X interrupt path.
 //
-//     1. records the interrupt in XHCI_INTERRUPT_PENDING
-//     2. sends LAPIC EOI
-//
-// This file is the normal kernel-context side of that design.
-//
-// poll() asks the custom XhciDriver to service a pending interrupt. The
-// driver consumes the software pending flag, checks the controller's own
-// interrupt state as a fallback, and then drains the event ring from normal
-// context.
+// The xHCI IDT handler does NOT consume the event ring. It only records the
+// interrupt and sends LAPIC EOI. The custom xHCI driver remains the sole event
+// ring consumer.
 //
 // ============================================================
 
-use super::init;
-
-// ============================================================
-// One USB polling pass
-// ============================================================
-//
-// Call this repeatedly from Rusty's existing kernel/service loop.
-//
-// ============================================================
+use super::{hid, init};
 
 #[inline]
 pub fn poll() {
@@ -33,13 +18,13 @@ pub fn poll() {
         return;
     }
 
-    // SAFETY:
-    //
-    // Rusty's current USB state is accessed from the single normal kernel
-    // service context. The xHCI interrupt handler never accesses this mutable
-    // state; it only updates the atomic pending flag in interrupts.rs.
     unsafe {
         let state = init::state_mut();
+
+        // First consume xHCI command/port/transfer events.
         state.xhci.service_interrupt();
+
+        // Then consume HID transfer completions and re-arm the endpoints.
+        state.hid.poll(&mut state.xhci);
     }
 }
