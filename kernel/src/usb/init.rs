@@ -6,6 +6,7 @@ use core::{
 
 use crate::{memory, serial, xhci_pci};
 
+use super::hid::HidManager;
 use super::xhci::XhciDriver;
 
 // ============================================================
@@ -21,6 +22,7 @@ use super::xhci::XhciDriver;
 
 pub(crate) struct UsbState {
     pub(crate) xhci: XhciDriver,
+    pub(crate) hid: HidManager,
 }
 
 // ============================================================
@@ -556,6 +558,12 @@ pub fn init() {
     }
 
     // ========================================================
+    // Prepare HID manager
+    // ========================================================
+
+    let mut hid = HidManager::new();
+
+    // ========================================================
     // No connected USB2 device
     // ========================================================
 
@@ -563,9 +571,18 @@ pub fn init() {
         serial::write_str("USB: no connected USB2 root port found\n");
         serial::write_str("USB: skipping USB2 enumeration test\n");
 
+        let hid_has_keyboard = hid.has_keyboard();
+        let hid_has_mouse = hid.has_mouse();
+
         unsafe {
-            (*USB_STORAGE.state.get()).write(UsbState { xhci });
+            (*USB_STORAGE.state.get()).write(UsbState {
+                xhci,
+                hid,
+            });
         }
+
+        crate::input::set_keyboard_present(hid_has_keyboard);
+        crate::input::set_mouse_present(hid_has_mouse);
 
         USB_INITIALIZED.store(1, Ordering::Release);
 
@@ -713,55 +730,56 @@ pub fn init() {
     }
 
     // ========================================================
-    // Enable Slot command
+    // Custom USB HID enumeration
     // ========================================================
     //
-    // The current XhciDriver API is:
+    // Enable Slot gives the device an xHCI Slot ID.  hid.rs then performs the
+    // real USB enumeration sequence:
     //
-    //     unsafe fn enable_slot(&mut self)
-    //
-    // It does NOT return a slot ID.
-    //
-    // The command is submitted to the command ring and its completion is
-    // delivered asynchronously as a Command Completion Event.
+    //     Address Device
+    //     GET_DESCRIPTOR(Device)
+    //     GET_DESCRIPTOR(Configuration)
+    //     SET_CONFIGURATION
+    //     SET_PROTOCOL (boot HID)
+    //     Configure Endpoint
+    //     submit persistent interrupt-IN transfer
     //
     // ========================================================
 
     if connected && enabled && !reset_active {
         serial::write_str("USB: submitting Enable Slot command...\n");
 
-        unsafe {
-            xhci.enable_slot();
-        }
+        let slot_id = unsafe {
+            xhci.enable_slot()
+        };
 
-        serial::write_str("USB: Enable Slot command submitted\n");
+        match slot_id {
+            Some(slot_id) => {
+                serial::write_str("USB: Enable Slot succeeded, slot=");
+                serial::write_hex(slot_id as u64);
+                serial::write_str("\n");
 
-        /*
-         * Give the controller several opportunities to generate/consume the
-         * completion event.  We deliberately do not turn this into a command
-         * completion busy-wait because the full slot/context machinery is not
-         * implemented yet.
-         */
-        const COMMAND_EVENT_WINDOW_US: u64 = 50_000;
-        const COMMAND_POLL_INTERVAL_US: u64 = 1_000;
+                serial::write_str("USB: starting USB device enumeration...\n");
 
-        let command_deadline = crate::delay::now_us().saturating_add(COMMAND_EVENT_WINDOW_US);
-
-        loop {
-            unsafe {
-                xhci.poll_events();
+                if unsafe {
+                    hid.enumerate_device(
+                        &mut xhci,
+                        test_port,
+                        slot_id,
+                    )
+                } {
+                    serial::write_str("USB: USB device enumeration completed\n");
+                } else {
+                    serial::write_str("USB: USB device enumeration failed\n");
+                }
             }
 
-            if crate::delay::now_us() >= command_deadline {
-                break;
+            None => {
+                serial::write_str("USB: Enable Slot failed\n");
             }
-
-            crate::delay::delay_us(COMMAND_POLL_INTERVAL_US);
         }
-
-        serial::write_str("USB: Enable Slot completion polling window complete\n");
     } else {
-        serial::write_str("USB: skipping Enable Slot because USB2 port is not ready\n");
+        serial::write_str("USB: skipping USB enumeration because USB2 port is not ready\n");
     }
 
     // ========================================================
@@ -778,9 +796,18 @@ pub fn init() {
     // Publish USB state
     // ========================================================
 
+    let hid_has_keyboard = hid.has_keyboard();
+    let hid_has_mouse = hid.has_mouse();
+
     unsafe {
-        (*USB_STORAGE.state.get()).write(UsbState { xhci });
+        (*USB_STORAGE.state.get()).write(UsbState {
+            xhci,
+            hid,
+        });
     }
+
+    crate::input::set_keyboard_present(hid_has_keyboard);
+    crate::input::set_mouse_present(hid_has_mouse);
 
     USB_INITIALIZED.store(1, Ordering::Release);
 

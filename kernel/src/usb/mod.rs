@@ -1,6 +1,6 @@
-pub mod devices;
+pub mod hid;
 pub mod init;
-pub mod keyboard;
-pub mod mouse;
-// pub mod poll;
+pub mod poll;
 pub mod xhci;
+
+pub use init::is_initialized;

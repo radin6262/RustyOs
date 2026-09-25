@@ -1,8 +1,8 @@
 #![no_std]
 
-use bootloader_api::BootInfo;
-use crate::{cpu, graphics, input, interrupts, memory, serial, wm};
 use crate::graphics::Color;
+use crate::{cpu, graphics, input, interrupts, memory, serial, wm};
+use bootloader_api::BootInfo;
 
 pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     // ========================================================
@@ -17,8 +17,6 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
 
     serial::init();
     serial::write_str("Rusty kernel started\n");
-
-
 
     // ========================================================
     // CPU / GDT / TSS
@@ -47,8 +45,6 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
 
     serial::write_str("Initializing Graphics\n");
 
-
-
     let Some(framebuffer) = boot_info.framebuffer.as_mut() else {
         serial::write_str("ERROR: framebuffer unavailable\n");
         return;
@@ -71,7 +67,6 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
 
     serial::write_str("Window Manager initialized\n");
 
-
     // Disable or enable on screen debug logging
     // Warning: Running on screen debug logs requires a beefy computer to render all that text
 
@@ -83,7 +78,6 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
 
     crate::delay::init();
     serial::write_str("Delay system calibrated\n");
-
 
     // ========================================================
     // System Boot Screen (Compositor Controlled)
@@ -211,7 +205,6 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     // Stage 1: Core Systems OK
     // update_boot_status(0, 0xFFA6E3A1, "Task 1/4: Core Systems (GDT/IDT/Mem) OK");
 
-
     // ========================================================
     // WASM runtime
     // ========================================================
@@ -224,21 +217,19 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     // update_boot_status(3, 0xFFA6E3A1, "Task 4/4: Boot Sequence Complete!");
     // serial::write_str("Boot sequence finished successfully\n");
 
-    serial::write_str(
-        "BOOT: initializing USB...\n",
-    );
+    serial::write_str("BOOT: initializing USB...\n");
 
     crate::usb::init::init();
 
+    serial::write_str("BOOT: USB initialization complete\n");
 
+    serial::write_str("BOOT: init interrupts\n");
 
-    serial::write_str(
-        "BOOT: USB initialization complete\n",
-    );
+    crate::interrupts::enable();
 
-    crate::serial::write_str(
-        "BOOT: calling USB poll...\n",
-    );
+    serial::write_str("BOOT: interrupts loaded\n");
+
+    crate::serial::write_str("BOOT: calling USB poll...\n");
 
     // crate::usb::poll::poll();
 
@@ -251,6 +242,4 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     //         wm.draw();
     //     }
     // }
-
-
 }

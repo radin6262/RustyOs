@@ -1,88 +1,60 @@
 use core::{
+    arch::x86_64::__cpuid,
     cell::UnsafeCell,
     mem::MaybeUninit,
+    ptr::{read_volatile, write_volatile},
+    sync::atomic::{AtomicBool, Ordering, fence},
 };
 
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::{
     set_general_handler,
-    structures::idt::{
-        InterruptDescriptorTable,
-        InterruptStackFrame,
-    },
+    structures::idt::{InterruptDescriptorTable, InterruptStackFrame},
 };
 
-use crate::{
-    serial,
-    syscall,
-};
+use crate::{memory, serial, syscall};
 
 // ============================================================
-// Programmable Interrupt Controller (PIC) Configuration
-// ============================================================
-//
-// PIC IRQ layout:
-//
-// PIC 1:
-//   IRQ 0 -> vector 32 (0x20)
-//   IRQ 1 -> vector 33 (0x21)
-//   ...
-//   IRQ 7 -> vector 39 (0x27)
-//
-// PIC 2:
-//   IRQ 8  -> vector 40 (0x28)
-//   ...
-//   IRQ 15 -> vector 47 (0x2F)
-//
-// Therefore vectors 32..47 are reserved for the remapped PIC.
-//
-// xHCI uses a separate vector.
-//
+// PIC configuration
 // ============================================================
 
 pub const PIC_1_OFFSET: u8 = 32;
-
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-// Dedicated xHCI interrupt vector.
-//
-// Keep this outside the remapped PIC range.
-//
-// 0x50 = 80 decimal.
-//
-// This is suitable as a dedicated MSI/MSI-X vector.
-//
+// Dedicated MSI/MSI-X vector for xHCI.
+// Must stay outside the remapped 8259 PIC range 32..47.
 pub const XHCI_INTERRUPT_VECTOR: u8 = 0x50;
+pub const APIC_SPURIOUS_VECTOR: u8 = 0xFF;
+
+pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe {
+    ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET)
+});
 
 // ============================================================
-// PIC
+// xHCI interrupt state
+// ============================================================
+//
+// The hardware handler is deliberately tiny.  It records that the xHCI
+// controller interrupted and completes the LAPIC EOI.  Normal USB code then
+// consumes the xHCI event ring from process/context code.
+//
 // ============================================================
 
-pub static PICS: Mutex<ChainedPics> = Mutex::new(
-    unsafe {
-        ChainedPics::new(
-            PIC_1_OFFSET,
-            PIC_2_OFFSET,
-        )
-    },
-);
+static XHCI_INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
+static LOCAL_APIC_READY: AtomicBool = AtomicBool::new(false);
+static LOCAL_APIC_X2APIC: AtomicBool = AtomicBool::new(false);
+static LOCAL_APIC_ID: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static LOCAL_APIC_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 // ============================================================
-// Static IDT storage
-// ============================================================
-//
-// The IDT must remain alive after init() returns.
-//
-// We therefore construct it in static storage and load a
-// &'static reference to it.
-//
+// IDT static storage
 // ============================================================
 
 struct IdtStorage {
-    idt: UnsafeCell<
-        MaybeUninit<InterruptDescriptorTable>,
-    >,
+    idt: UnsafeCell<MaybeUninit<InterruptDescriptorTable>>,
 }
 
 unsafe impl Sync for IdtStorage {}
@@ -90,261 +62,304 @@ unsafe impl Sync for IdtStorage {}
 impl IdtStorage {
     const fn new() -> Self {
         Self {
-            idt: UnsafeCell::new(
-                MaybeUninit::uninit(),
-            ),
+            idt: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 }
 
-static IDT_STORAGE: IdtStorage =
-    IdtStorage::new();
+static IDT_STORAGE: IdtStorage = IdtStorage::new();
 
 // ============================================================
-// Initialize IDT
+// Local APIC constants
+// ============================================================
+
+const IA32_APIC_BASE_MSR: u32 = 0x1B;
+const IA32_X2APIC_APIC_ID: u32 = 0x802;
+const IA32_X2APIC_EOI: u32 = 0x80B;
+const IA32_X2APIC_SIVR: u32 = 0x80F;
+
+const APIC_BASE_GLOBAL_ENABLE: u64 = 1 << 11;
+const APIC_BASE_X2APIC_ENABLE: u64 = 1 << 10;
+const APIC_BASE_ADDRESS_MASK: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+const APIC_ID_OFFSET: usize = 0x020;
+const APIC_EOI_OFFSET: usize = 0x0B0;
+const APIC_SVR_OFFSET: usize = 0x0F0;
+
+const APIC_SVR_ENABLE: u32 = 1 << 8;
+const APIC_SVR_VECTOR_MASK: u32 = 0xFF;
+
+// ============================================================
+// Raw MSR helpers
+// ============================================================
+
+#[inline(always)]
+unsafe fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    ((high as u64) << 32) | low as u64
+}
+
+#[inline(always)]
+unsafe fn write_msr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+// ============================================================
+// Local APIC initialization
+// ============================================================
+
+unsafe fn init_local_apic() {
+    let cpuid = unsafe { __cpuid(1) };
+
+    // CPUID.01H:EDX[5] = MSR instruction support.
+    if cpuid.edx & (1 << 5) == 0 {
+        panic!("Rusty: CPU does not advertise MSR instructions");
+    }
+
+    // CPUID.01H:EDX[9] = local APIC.
+    if cpuid.edx & (1 << 9) == 0 {
+        panic!("Rusty: CPU does not advertise a local APIC");
+    }
+
+    let mut apic_base_msr = unsafe { read_msr(IA32_APIC_BASE_MSR) };
+
+    // Ensure the local APIC is globally enabled.
+    if apic_base_msr & APIC_BASE_GLOBAL_ENABLE == 0 {
+        apic_base_msr |= APIC_BASE_GLOBAL_ENABLE;
+        unsafe { write_msr(IA32_APIC_BASE_MSR, apic_base_msr) };
+    }
+
+    let x2apic = (apic_base_msr & APIC_BASE_X2APIC_ENABLE) != 0;
+    LOCAL_APIC_X2APIC.store(x2apic, Ordering::Release);
+
+    let base = apic_base_msr & APIC_BASE_ADDRESS_MASK;
+    LOCAL_APIC_BASE.store(base, Ordering::Release);
+
+    if x2apic {
+        // In x2APIC mode the APIC register file is MSR-based.
+        let mut sivr = unsafe { read_msr(IA32_X2APIC_SIVR) as u32 };
+        sivr |= APIC_SVR_ENABLE;
+        sivr = (sivr & !APIC_SVR_VECTOR_MASK) | APIC_SPURIOUS_VECTOR as u32;
+        unsafe { write_msr(IA32_X2APIC_SIVR, sivr as u64) };
+
+        let apic_id = unsafe { read_msr(IA32_X2APIC_APIC_ID) as u32 };
+        LOCAL_APIC_ID.store(apic_id, Ordering::Release);
+
+        serial::write_str("APIC: enabled in x2APIC mode, ID=");
+        serial::write_hex(apic_id as u64);
+        serial::write_str("\n");
+    } else {
+        // xAPIC mode exposes the register file at IA32_APIC_BASE.
+        if base == 0 {
+            panic!("Rusty: local APIC base is zero");
+        }
+
+        // Identity mapping is required because the CPU's xAPIC registers are
+        // accessed as physical MMIO.
+        unsafe {
+            memory::identity_map_mmio(base as usize, 0x1000);
+        }
+
+        let apic_base = base as usize;
+
+        let mut sivr = unsafe { read_volatile((apic_base + APIC_SVR_OFFSET) as *const u32) };
+        sivr |= APIC_SVR_ENABLE;
+        sivr = (sivr & !APIC_SVR_VECTOR_MASK) | APIC_SPURIOUS_VECTOR as u32;
+        unsafe { write_volatile((apic_base + APIC_SVR_OFFSET) as *mut u32, sivr) };
+
+        let apic_id = unsafe { read_volatile((apic_base + APIC_ID_OFFSET) as *const u32) >> 24 };
+        LOCAL_APIC_ID.store(apic_id, Ordering::Release);
+
+        serial::write_str("APIC: enabled in xAPIC mode, base=");
+        serial::write_hex(base);
+        serial::write_str(" ID=");
+        serial::write_hex(apic_id as u64);
+        serial::write_str("\n");
+    }
+
+    LOCAL_APIC_READY.store(true, Ordering::Release);
+}
+
+// ============================================================
+// MSI message composition
+// ============================================================
+//
+// For Rusty's current single-core/BSP use, MSI is targeted at the local APIC
+// using fixed physical delivery. Standard PCI MSI carries an 8-bit APIC
+// destination in address bits 19:12. If a future SMP implementation needs APIC
+// IDs above 255, this must be extended together with platform interrupt
+// remapping / extended-destination support.
+//
+// ============================================================
+
+pub fn msi_message(vector: u8) -> Option<(u64, u16)> {
+    if !LOCAL_APIC_READY.load(Ordering::Acquire) {
+        serial::write_str("APIC: MSI message requested before APIC initialization\n");
+        return None;
+    }
+
+    let apic_id = LOCAL_APIC_ID.load(Ordering::Acquire);
+
+    if apic_id > 0xFF {
+        serial::write_str("APIC: APIC ID exceeds 8-bit MSI destination range\n");
+        serial::write_str("APIC: interrupt remapping/extended destination support is required\n");
+        return None;
+    }
+
+    let address = 0xFEE0_0000u64 | ((apic_id as u64) << 12);
+
+    // Fixed delivery, physical destination, edge triggered/active high are
+    // represented by the default zero delivery fields; the vector occupies
+    // bits 7:0.
+    let data = vector as u16;
+
+    Some((address, data))
+}
+
+// ============================================================
+// LAPIC EOI
+// ============================================================
+
+#[inline(always)]
+pub fn lapic_eoi() {
+    if !LOCAL_APIC_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    fence(Ordering::SeqCst);
+
+    if LOCAL_APIC_X2APIC.load(Ordering::Acquire) {
+        unsafe { write_msr(IA32_X2APIC_EOI, 0) };
+    } else {
+        let base = LOCAL_APIC_BASE.load(Ordering::Acquire) as usize;
+        unsafe {
+            write_volatile((base + APIC_EOI_OFFSET) as *mut u32, 0);
+        }
+    }
+}
+
+// ============================================================
+// xHCI pending flag API
+// ============================================================
+
+#[inline(always)]
+pub fn take_xhci_interrupt() -> bool {
+    XHCI_INTERRUPT_PENDING.swap(false, Ordering::AcqRel)
+}
+
+#[inline(always)]
+pub fn clear_xhci_interrupt_pending() {
+    XHCI_INTERRUPT_PENDING.store(false, Ordering::Release);
+}
+
+#[inline(always)]
+pub fn xhci_interrupt_pending() -> bool {
+    XHCI_INTERRUPT_PENDING.load(Ordering::Acquire)
+}
+
+// ============================================================
+// Initialize IDT + PIC + LAPIC
 // ============================================================
 
 pub fn init() {
-    // --------------------------------------------------------
-    // Construct a completely new IDT.
-    // --------------------------------------------------------
+    let mut idt = InterruptDescriptorTable::new();
 
-    let mut idt =
-        InterruptDescriptorTable::new();
+    set_general_handler!(&mut idt, general_exception_handler, 12..15);
 
-    // --------------------------------------------------------
-    // General exception handler
-    //
-    // #SS = 12
-    // #GP = 13
-    // #PF = 14
-    //
-    // set_general_handler! generates the required wrapper
-    // functions for the different exception types.
-    // --------------------------------------------------------
+    idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+    idt.double_fault.set_handler_fn(double_fault_handler);
 
-    set_general_handler!(
-        &mut idt,
-        general_exception_handler,
-        12..15
-    );
-
-    // --------------------------------------------------------
-    // Invalid opcode (#UD)
-    // --------------------------------------------------------
-
-    idt.invalid_opcode
-        .set_handler_fn(
-            invalid_opcode_handler,
-        );
-
-    // --------------------------------------------------------
-    // Double fault (#DF)
-    // --------------------------------------------------------
-
-    idt.double_fault
-        .set_handler_fn(
-            double_fault_handler,
-        );
-
-    // --------------------------------------------------------
-    // Hardware timer
-    //
-    // IRQ 0
-    //     |
-    //     +----> vector 32 / 0x20
-    // --------------------------------------------------------
-
-    idt[PIC_1_OFFSET]
-        .set_handler_fn(
-            timer_interrupt_handler,
-        );
-
-    // --------------------------------------------------------
-    // xHCI interrupt
-    //
-    // IMPORTANT:
-    //
-    // InterruptDescriptorTable implements Index<u8>,
-    // NOT Index<usize>.
-    //
-    // XHCI_INTERRUPT_VECTOR is already u8, so DO NOT do:
-    //
-    //     XHCI_INTERRUPT_VECTOR as usize
-    //
-    // Use the u8 directly.
-    // --------------------------------------------------------
-
-    idt[XHCI_INTERRUPT_VECTOR]
-        .set_handler_fn(
-            xhci_interrupt_handler,
-        );
-
-    // --------------------------------------------------------
-    // Syscall
-    // --------------------------------------------------------
-    //
-    // This installs the existing syscall entry point.
-    //
-    // The syscall implementation owns its own ABI/assembly
-    // handling, so we leave that code untouched.
-    // --------------------------------------------------------
+    idt[PIC_1_OFFSET].set_handler_fn(timer_interrupt_handler);
+    idt[XHCI_INTERRUPT_VECTOR].set_handler_fn(xhci_interrupt_handler);
+    idt[APIC_SPURIOUS_VECTOR].set_handler_fn(apic_spurious_interrupt_handler);
 
     unsafe {
-        syscall::install(
-            &mut idt,
-        );
+        syscall::install(&mut idt);
     }
-
-    // --------------------------------------------------------
-    // Move IDT into permanent static storage.
-    // --------------------------------------------------------
 
     unsafe {
-        (*IDT_STORAGE.idt.get())
-            .write(idt);
+        (*IDT_STORAGE.idt.get()).write(idt);
     }
 
-    // --------------------------------------------------------
-    // Obtain the permanent IDT reference.
-    // --------------------------------------------------------
-
-    let idt_ref:
-        &'static InterruptDescriptorTable =
-        unsafe {
-            &*(
-                (*IDT_STORAGE.idt.get())
-                    .as_ptr()
-            )
-        };
-
-    // --------------------------------------------------------
-    // Load IDTR.
-    // --------------------------------------------------------
+    let idt_ref: &'static InterruptDescriptorTable = unsafe {
+        &*((*IDT_STORAGE.idt.get()).as_ptr())
+    };
 
     unsafe {
         idt_ref.load();
     }
 
-    // --------------------------------------------------------
-    // Initialize the remapped PIC.
-    // --------------------------------------------------------
+    unsafe {
+        PICS.lock().initialize();
+    }
 
     unsafe {
-        PICS
-            .lock()
-            .initialize();
+        init_local_apic();
     }
 }
 
 // ============================================================
-// Hardware Timer Interrupt
+// Explicit CPU interrupt enable
 // ============================================================
-//
-// IRQ 0 -> PIC vector 32.
-//
-// We deliberately do NOT perform scheduling here.
-//
-// A normal x86-interrupt Rust handler only receives the CPU
-// interrupt stack frame. It does not expose all GPRs:
-//
-//     rax rbx rcx rdx
-//     rsi rdi rbp
-//     r8-r15
-//
-// Your scheduler requires the complete SavedUserContext.
-//
-// Therefore:
-//
-//     timer IRQ
-//          |
-//          v
-//     assembly entry
-//          |
-//          v
-//     save GPRs
-//          |
-//          v
-//     build SavedUserContext
-//          |
-//          v
-//     scheduler
-//          |
-//          v
-//     restore context
-//          |
-//          v
-//        iretq
-//
-// Do not fake preemptive scheduling by calling the scheduler
-// directly from this Rust handler.
-//
 
-extern "x86-interrupt" fn
-timer_interrupt_handler(
-    _stack_frame: InterruptStackFrame,
-) {
-    // --------------------------------------------------------
-    // Acknowledge IRQ 0.
-    // --------------------------------------------------------
+pub fn enable() {
+    x86_64::instructions::interrupts::enable();
+}
 
+pub fn disable() {
+    x86_64::instructions::interrupts::disable();
+}
+
+// ============================================================
+// Hardware timer interrupt
+// ============================================================
+
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
-        PICS
-            .lock()
-            .notify_end_of_interrupt(
-                PIC_1_OFFSET,
-            );
+        PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET);
     }
 }
 
 // ============================================================
-// xHCI Interrupt
+// xHCI MSI/MSI-X interrupt
 // ============================================================
-//
-// This handler is intentionally lightweight.
-//
-// The xHCI controller should be configured to generate an
-// interrupt using the XHCI_INTERRUPT_VECTOR vector.
-//
-// Do not perform large USB operations directly from the IDT
-// handler.
-//
-// The normal design is:
-//
-//     xHCI hardware
-//          |
-//          v
-//     IDT handler
-//          |
-//          v
-//     acknowledge / mark pending
-//          |
-//          v
-//     USB poll/service path
-//          |
-//          v
-//     CrabUSB
-//
-// This is especially important because CrabUSB is asynchronous.
-// Its event processing should remain in the normal USB service
-// path rather than doing enumeration/control transfers from
-// interrupt context.
-//
 
-extern "x86-interrupt" fn
-xhci_interrupt_handler(
-    _stack_frame: InterruptStackFrame,
-) {
-    // --------------------------------------------------------
-    // Record that xHCI generated an interrupt.
-    //
-    // The actual xHCI event-ring processing remains in the
-    // normal USB polling/service path.
-    // --------------------------------------------------------
+extern "x86-interrupt" fn xhci_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Never run xHCI event processing or USB enumeration from this handler.
+    // Record the interrupt and acknowledge the local APIC immediately.
+    XHCI_INTERRUPT_PENDING.store(true, Ordering::Release);
+    lapic_eoi();
+}
 
-    serial::write_str(
-        "INTERRUPT: xHCI\n",
-    );
+// ============================================================
+// APIC spurious interrupt
+// ============================================================
+
+extern "x86-interrupt" fn apic_spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Spurious APIC interrupts are not EOI'd.
 }
 
 // ============================================================
@@ -356,217 +371,83 @@ fn general_exception_handler(
     index: u8,
     error_code: Option<u64>,
 ) {
-    serial::write_str(
-        "\n\n=== CPU EXCEPTION ===\n",
-    );
+    serial::write_str("\n\n=== CPU EXCEPTION ===\n");
+    serial::write_str("VECTOR: ");
+    serial::write_usize(index as usize);
 
-    serial::write_str(
-        "VECTOR: ",
-    );
+    serial::write_str("\nRIP: ");
+    serial::write_hex(stack_frame.instruction_pointer.as_u64());
 
-    serial::write_usize(
-        index as usize,
-    );
+    serial::write_str("\nCS: ");
+    serial::write_hex(stack_frame.code_segment.0 as u64);
 
-    serial::write_str(
-        "\nRIP: ",
-    );
+    serial::write_str("\nRSP: ");
+    serial::write_hex(stack_frame.stack_pointer.as_u64());
 
-    serial::write_hex(
-        stack_frame
-            .instruction_pointer
-            .as_u64(),
-    );
-
-    serial::write_str(
-        "\nCS: ",
-    );
-
-    serial::write_hex(
-        stack_frame
-            .code_segment
-            .0 as u64,
-    );
-
-    serial::write_str(
-        "\nRSP: ",
-    );
-
-    serial::write_hex(
-        stack_frame
-            .stack_pointer
-            .as_u64(),
-    );
-
-    serial::write_str(
-        "\nSS: ",
-    );
-
-    serial::write_hex(
-        stack_frame
-            .stack_segment
-            .0 as u64,
-    );
-
-    // --------------------------------------------------------
-    // Page-fault specific information
-    // --------------------------------------------------------
+    serial::write_str("\nSS: ");
+    serial::write_hex(stack_frame.stack_segment.0 as u64);
 
     if index == 14 {
-        serial::write_str(
-            "\nCR2: ",
-        );
-
-        serial::write_hex(
-            x86_64::registers::control::Cr2::read()
-                .unwrap()
-                .as_u64(),
-        );
+        serial::write_str("\nCR2: ");
+        serial::write_hex(x86_64::registers::control::Cr2::read().unwrap().as_u64());
     }
 
-    // --------------------------------------------------------
-    // Error code
-    // --------------------------------------------------------
-
-    serial::write_str(
-        "\nERROR: ",
-    );
+    serial::write_str("\nERROR: ");
 
     match error_code {
         Some(value) => {
-            serial::write_hex(
-                value,
-            );
-
-            // ------------------------------------------------
-            // Decode page-fault error code
-            //
-            // Bit 0:
-            //     0 = non-present page
-            //     1 = protection violation
-            //
-            // Bit 1:
-            //     0 = read
-            //     1 = write
-            //
-            // Bit 2:
-            //     0 = supervisor
-            //     1 = user
-            //
-            // Bit 3:
-            //     1 = reserved-bit violation
-            //
-            // Bit 4:
-            //     1 = instruction fetch
-            //
-            // Bit 5:
-            //     1 = protection-key violation
-            //
-            // Bit 6:
-            //     1 = shadow-stack access
-            //
-            // Bit 7:
-            //     1 = RMP violation
-            // ------------------------------------------------
+            serial::write_hex(value);
 
             if index == 14 {
-                serial::write_str(
-                    "\nPAGE FAULT:",
-                );
+                serial::write_str("\nPAGE FAULT:");
 
                 if value & 1 != 0 {
-                    serial::write_str(
-                        " protection-violation",
-                    );
+                    serial::write_str(" protection-violation");
                 } else {
-                    serial::write_str(
-                        " non-present",
-                    );
+                    serial::write_str(" non-present");
                 }
 
                 if value & 2 != 0 {
-                    serial::write_str(
-                        " write",
-                    );
+                    serial::write_str(" write");
                 } else {
-                    serial::write_str(
-                        " read",
-                    );
+                    serial::write_str(" read");
                 }
 
                 if value & 4 != 0 {
-                    serial::write_str(
-                        " user",
-                    );
+                    serial::write_str(" user");
                 } else {
-                    serial::write_str(
-                        " supervisor",
-                    );
+                    serial::write_str(" supervisor");
                 }
 
                 if value & 8 != 0 {
-                    serial::write_str(
-                        " reserved-bit",
-                    );
+                    serial::write_str(" reserved-bit");
                 }
-
                 if value & 16 != 0 {
-                    serial::write_str(
-                        " instruction-fetch",
-                    );
+                    serial::write_str(" instruction-fetch");
                 }
-
                 if value & 32 != 0 {
-                    serial::write_str(
-                        " protection-key",
-                    );
+                    serial::write_str(" protection-key");
                 }
-
                 if value & 64 != 0 {
-                    serial::write_str(
-                        " shadow-stack",
-                    );
+                    serial::write_str(" shadow-stack");
                 }
-
                 if value & 128 != 0 {
-                    serial::write_str(
-                        " rmp",
-                    );
+                    serial::write_str(" rmp");
                 }
 
-                // ------------------------------------------------
-                // Common NX interpretation:
-                //
-                // protection violation
-                // + user
-                // + instruction fetch
-                //
-                // This is consistent with attempting to execute
-                // from a page that is not executable.
-                // ------------------------------------------------
-
-                if value & 1 != 0
-                    && value & 4 != 0
-                    && value & 16 != 0
-                {
+                if value & 1 != 0 && value & 4 != 0 && value & 16 != 0 {
                     serial::write_str(
                         "\nLIKELY CAUSE: instruction fetch was rejected (possible NX/NO_EXECUTE page)",
                     );
                 }
             }
         }
-
         None => {
-            serial::write_str(
-                "<none>",
-            );
+            serial::write_str("<none>");
         }
     }
 
-    serial::write_str(
-        "\n====================\n",
-    );
-
+    serial::write_str("\n====================\n");
     halt();
 }
 
@@ -574,38 +455,16 @@ fn general_exception_handler(
 // Invalid opcode (#UD)
 // ============================================================
 
-extern "x86-interrupt" fn
-invalid_opcode_handler(
-    stack_frame: InterruptStackFrame,
-) {
-    serial::write_str(
-        "\n\n=== INVALID OPCODE ===\n",
-    );
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    serial::write_str("\n\n=== INVALID OPCODE ===\n");
 
-    serial::write_str(
-        "RIP: ",
-    );
+    serial::write_str("RIP: ");
+    serial::write_hex(stack_frame.instruction_pointer.as_u64());
 
-    serial::write_hex(
-        stack_frame
-            .instruction_pointer
-            .as_u64(),
-    );
+    serial::write_str("\nCS: ");
+    serial::write_hex(stack_frame.code_segment.0 as u64);
 
-    serial::write_str(
-        "\nCS: ",
-    );
-
-    serial::write_hex(
-        stack_frame
-            .code_segment
-            .0 as u64,
-    );
-
-    serial::write_str(
-        "\n=======================\n",
-    );
-
+    serial::write_str("\n=======================\n");
     halt();
 }
 
@@ -613,47 +472,22 @@ invalid_opcode_handler(
 // Double fault (#DF)
 // ============================================================
 
-extern "x86-interrupt" fn
-double_fault_handler(
+extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
-    serial::write_str(
-        "\n\n=== DOUBLE FAULT ===\n",
-    );
+    serial::write_str("\n\n=== DOUBLE FAULT ===\n");
 
-    serial::write_str(
-        "ERROR: ",
-    );
+    serial::write_str("ERROR: ");
+    serial::write_hex(error_code);
 
-    serial::write_hex(
-        error_code,
-    );
+    serial::write_str("\nRIP: ");
+    serial::write_hex(stack_frame.instruction_pointer.as_u64());
 
-    serial::write_str(
-        "\nRIP: ",
-    );
+    serial::write_str("\nCS: ");
+    serial::write_hex(stack_frame.code_segment.0 as u64);
 
-    serial::write_hex(
-        stack_frame
-            .instruction_pointer
-            .as_u64(),
-    );
-
-    serial::write_str(
-        "\nCS: ",
-    );
-
-    serial::write_hex(
-        stack_frame
-            .code_segment
-            .0 as u64,
-    );
-
-    serial::write_str(
-        "\n=====================\n",
-    );
-
+    serial::write_str("\n=====================\n");
     halt();
 }
 

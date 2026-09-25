@@ -387,24 +387,6 @@ struct CommandCompletion {
     slot_id: u8,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct TransferCompletion {
-    pub trb: u64,
-    pub completion_code: u8,
-    pub transfer_length: u32,
-    pub slot_id: u8,
-    pub endpoint_id: u8,
-}
-
-struct InterruptEndpoint {
-    pub slot_id: u8,
-    pub endpoint_id: u8,
-    pub ring: Ring,
-    pub buffer_phys: u64,
-    pub buffer_virt: usize,
-    pub packet_size: usize,
-}
-
 /*
  * ==========================================================================
  * Driver
@@ -509,17 +491,8 @@ pub struct XhciDriver {
     pub input_context_phys: Vec<u64>,
     pub input_context_virt: Vec<usize>,
 
-    /* Most recently completed command result. */
+    /* Most recently completed Enable Slot result. */
     last_command_completion: Option<CommandCompletion>,
-
-    /* Transfer completions are queued by the sole event-ring consumer. */
-    transfer_completions: Vec<TransferCompletion>,
-
-    /* Endpoint 0 transfer rings, indexed by xHCI Slot ID. */
-    ep0_rings: Vec<Option<Ring>>,
-
-    /* Persistent interrupt-IN endpoint state. */
-    interrupt_endpoints: Vec<InterruptEndpoint>,
 
     /* Last root port that completed a reset and is ready for enumeration. */
     ready_port: usize,
@@ -730,11 +703,6 @@ impl XhciDriver {
         let mut input_context_virt = Vec::<usize>::with_capacity(context_table_len);
         input_context_virt.resize(context_table_len, 0);
 
-        let mut ep0_rings = Vec::<Option<Ring>>::with_capacity(context_table_len);
-        ep0_rings.resize_with(context_table_len, || None);
-
-        let interrupt_endpoints = Vec::<InterruptEndpoint>::new();
-
         let mut driver = Self {
             regs,
 
@@ -773,9 +741,6 @@ impl XhciDriver {
             input_context_phys,
             input_context_virt,
             last_command_completion: None,
-            transfer_completions: Vec::new(),
-            ep0_rings,
-            interrupt_endpoints,
             ready_port: 0,
 
             erst_phys,
@@ -1803,9 +1768,6 @@ impl XhciDriver {
         self.running = false;
         self.ready_port = 0;
         self.last_command_completion = None;
-        self.transfer_completions.clear();
-        self.ep0_rings.iter_mut().for_each(|ring| *ring = None);
-        self.interrupt_endpoints.clear();
         self.device_context_phys.fill(0);
         self.device_context_virt.fill(0);
         self.input_context_phys.fill(0);
@@ -3273,6 +3235,13 @@ impl XhciDriver {
         fence(Ordering::SeqCst);
         self.regs.set_erdp_clear_busy(0, self.event_dequeue);
 
+        if processed != 0 {
+            crate::serial::write_str("xHCI: drained event TRBs = ");
+            crate::serial::write_hex(processed as u64);
+            crate::serial::write_str(" next ERDP = 0x");
+            crate::serial::write_hex(self.event_dequeue);
+            crate::serial::write_str("\n");
+        }
 
         /*
          * Clear the controller's event-interrupt indication after the event
@@ -3635,745 +3604,35 @@ impl XhciDriver {
 
     unsafe fn handle_transfer_event(&mut self, trb: Trb) {
         let completion_code = (trb.status >> 24) as u8;
+
         let transfer_length = trb.status & 0x00FF_FFFF;
+
         let endpoint_id = ((trb.control >> 16) & 0x1F) as u8;
-        let slot_id = ((trb.control >> 24) & 0xFF) as u8;
 
-        self.transfer_completions.push(TransferCompletion {
-            trb: trb.parameter,
-            completion_code,
-            transfer_length,
-            slot_id,
-            endpoint_id,
-        });
+        let slot_id = (trb.control >> 24) as u8;
 
-        if completion_code != 1 && completion_code != 13 {
-            crate::serial::write_str("xHCI: transfer event error code=");
-            crate::serial::write_hex(completion_code as u64);
-            crate::serial::write_str(" slot=");
-            crate::serial::write_hex(slot_id as u64);
-            crate::serial::write_str(" endpoint=");
-            crate::serial::write_hex(endpoint_id as u64);
-            crate::serial::write_str(" length=");
-            crate::serial::write_hex(transfer_length as u64);
-            crate::serial::write_str("\n");
-        }
-    }
+        crate::serial::write_str("xHCI: transfer event code=");
 
-    /*
-     * ======================================================================
-     * Queue/consume transfer completions
-     * ======================================================================
-     */
+        crate::serial::write_hex(completion_code as u64);
 
-    pub fn take_transfer_completion(&mut self) -> Option<TransferCompletion> {
-        if self.transfer_completions.is_empty() {
-            None
-        } else {
-            Some(self.transfer_completions.remove(0))
-        }
-    }
+        crate::serial::write_str(" slot=");
 
-    fn take_transfer_completion_for(&mut self, trb: u64) -> Option<TransferCompletion> {
-        let position = self
-            .transfer_completions
-            .iter()
-            .position(|completion| completion.trb == trb)?;
-
-        Some(self.transfer_completions.remove(position))
-    }
-
-    /*
-     * ======================================================================
-     * Command completion helper
-     * ======================================================================
-     */
-
-    unsafe fn submit_command_wait(
-        &mut self,
-        trb: Trb,
-        expected_command_trb: Option<u64>,
-        timeout_us: u64,
-    ) -> Option<CommandCompletion> {
-        self.last_command_completion = None;
-
-        let command_phys = self.command_ring.push(trb);
-
-        dma_sync_for_device(
-            self.command_ring.buffer.as_ptr() as *const u8,
-            self.command_ring.size * XHCI_TRB_SIZE,
-        );
-        fence(Ordering::SeqCst);
-        self.regs.ring_command();
-
-        let deadline = crate::delay::now_us().saturating_add(timeout_us);
-
-        loop {
-            self.poll_events();
-
-            if let Some(completion) = self.last_command_completion {
-                if completion.command_trb == command_phys
-                    && expected_command_trb.map_or(true, |expected| expected == command_phys)
-                {
-                    return Some(completion);
-                }
-            }
-
-            if crate::delay::now_us() >= deadline {
-                crate::serial::write_str("xHCI: command timed out, TRB=0x");
-                crate::serial::write_hex(command_phys);
-                crate::serial::write_str("\n");
-                return None;
-            }
-
-            crate::delay::delay_us(XHCI_POLL_INTERVAL_US);
-        }
-    }
-
-    /*
-     * ======================================================================
-     * Endpoint 0 ring allocation
-     * ======================================================================
-     */
-
-    fn ensure_ep0_ring(&mut self, slot_id: u8) -> bool {
-        let slot = slot_id as usize;
-
-        if slot == 0 || slot >= self.ep0_rings.len() || slot > self.max_slots {
-            return false;
-        }
-
-        if self.ep0_rings[slot].is_none() {
-            self.ep0_rings[slot] = Some(Ring::new(COMMAND_RING_TRBS));
-        }
-
-        true
-    }
-
-    /*
-     * ======================================================================
-     * Build the Address Device input context
-     * ======================================================================
-     */
-
-    unsafe fn prepare_address_device_context(
-        &mut self,
-        slot_id: u8,
-        port: usize,
-        speed: u8,
-        max_packet_size: u16,
-    ) -> bool {
-        if !self.ensure_ep0_ring(slot_id) {
-            return false;
-        }
-
-        let slot = slot_id as usize;
-        let input_phys = match self.input_context_phys.get(slot).copied() {
-            Some(value) if value != 0 => value,
-            _ => return false,
-        };
-        let input_virt = match self.input_context_virt.get(slot).copied() {
-            Some(value) if value != 0 => value,
-            _ => return false,
-        };
-
-        let ring_phys = match self.ep0_rings[slot].as_ref() {
-            Some(ring) => ring.phys_addr,
-            None => return false,
-        };
-
-        let stride = self.context_size;
-        let slot_ctx = input_virt + stride;
-        let ep0_ctx = slot_ctx + stride;
-
-        /* Input Control Context: add Slot + EP0. */
-        write_volatile(input_virt as *mut u32, 0);
-        write_volatile((input_virt + 4) as *mut u32, 0x0000_0003);
-
-        /* Slot Context. */
-        let slot_dword0 =
-            ((speed as u32) << 20) | (1u32 << 27);
-        let slot_dword1 = (port as u32 & 0xFF) << 16;
-
-        write_volatile(slot_ctx as *mut u32, slot_dword0);
-        write_volatile((slot_ctx + 4) as *mut u32, slot_dword1);
-        write_volatile((slot_ctx + 8) as *mut u32, 0);
-        write_volatile((slot_ctx + 12) as *mut u32, 0);
-
-        /* Endpoint 0 Context. */
-        let ep_info = 0u32;
-        let ep_info2 = (3u32 << 1) | (4u32 << 3) | ((max_packet_size as u32) << 16);
-
-        write_volatile(ep0_ctx as *mut u32, ep_info);
-        write_volatile((ep0_ctx + 4) as *mut u32, ep_info2);
-        write_volatile((ep0_ctx + 8) as *mut u64, ring_phys | 1);
-        write_volatile((ep0_ctx + 16) as *mut u32, 8);
-
-        dma_sync_for_device(
-            input_virt as *const u8,
-            stride * 3,
-        );
-        fence(Ordering::SeqCst);
-
-        let command = Trb::new(
-            input_phys,
-            0,
-            (TrbType::AddressDeviceCommand as u32) << 10,
-        );
-
-        let mut command = command;
-        command.set_slot_id(slot_id);
-
-        let Some(completion) = self.submit_command_wait(
-            command,
-            None,
-            1_000_000,
-        ) else {
-            return false;
-        };
-
-        if completion.completion_code != 1 {
-            crate::serial::write_str("xHCI: Address Device failed code=");
-            crate::serial::write_hex(completion.completion_code as u64);
-            crate::serial::write_str("\n");
-            return false;
-        }
-
-        crate::serial::write_str("xHCI: Address Device succeeded slot=");
         crate::serial::write_hex(slot_id as u64);
-        crate::serial::write_str(" port=");
-        crate::serial::write_hex(port as u64);
-        crate::serial::write_str(" speed=");
-        crate::serial::write_hex(speed as u64);
-        crate::serial::write_str(" MPS0=");
-        crate::serial::write_hex(max_packet_size as u64);
-        crate::serial::write_str("\n");
 
-        true
-    }
+        crate::serial::write_str(" endpoint=");
 
-    /*
-     * ======================================================================
-     * Evaluate Context: update EP0 max packet size after the first
-     * 8-byte Device Descriptor has reported bMaxPacketSize0.
-     * ======================================================================
-     */
-
-    unsafe fn evaluate_ep0_max_packet(&mut self, slot_id: u8, max_packet_size: u16) -> bool {
-        let slot = slot_id as usize;
-        if slot == 0 || slot >= self.input_context_phys.len() {
-            return false;
-        }
-
-        if !self.ensure_ep0_ring(slot_id) {
-            return false;
-        }
-
-        let output_virt = self.device_context_virt[slot];
-        let input_virt = self.input_context_virt[slot];
-        let input_phys = self.input_context_phys[slot];
-
-        if output_virt == 0 || input_virt == 0 || input_phys == 0 {
-            return false;
-        }
-
-        let stride = self.context_size;
-        let input_control = input_virt;
-        let input_slot = input_virt + stride;
-        let input_ep0 = input_slot + stride;
-        let output_slot = output_virt;
-        let output_ep0 = output_virt + stride;
-
-        /* Input Control: EP0 only. */
-        write_volatile(input_control as *mut u32, 0);
-        write_volatile((input_control + 4) as *mut u32, 0x0000_0002);
-
-        /* Preserve the complete current Slot Context. */
-        for index in 0..(stride / 4).min(8) {
-            let value = read_volatile((output_slot + index * 4) as *const u32);
-            write_volatile((input_slot + index * 4) as *mut u32, value);
-        }
-
-        /* Preserve EP0, changing only Max Packet Size. */
-        for index in 0..(stride / 4).min(8) {
-            let value = read_volatile((output_ep0 + index * 4) as *const u32);
-            write_volatile((input_ep0 + index * 4) as *mut u32, value);
-        }
-
-        let mut ep_info2 = read_volatile((input_ep0 + 4) as *const u32);
-        ep_info2 &= !(0xFFFFu32 << 16);
-        ep_info2 |= (max_packet_size as u32) << 16;
-        write_volatile((input_ep0 + 4) as *mut u32, ep_info2);
-
-        dma_sync_for_device(input_virt as *const u8, stride * 3);
-        fence(Ordering::SeqCst);
-
-        let mut command = Trb::new(
-            input_phys,
-            0,
-            (TrbType::EvaluateContextCommand as u32) << 10,
-        );
-        command.set_slot_id(slot_id);
-
-        let Some(completion) = self.submit_command_wait(command, None, 1_000_000) else {
-            return false;
-        };
-
-        if completion.completion_code != 1 {
-            crate::serial::write_str("xHCI: Evaluate Context failed code=");
-            crate::serial::write_hex(completion.completion_code as u64);
-            crate::serial::write_str("\n");
-            return false;
-        }
-
-        true
-    }
-
-    /*
-     * ======================================================================
-     * Address USB device
-     * ======================================================================
-     */
-
-    pub unsafe fn address_device(
-        &mut self,
-        slot_id: u8,
-        port: usize,
-        speed: u8,
-        max_packet_size: u16,
-    ) -> bool {
-        self.prepare_address_device_context(slot_id, port, speed, max_packet_size)
-    }
-
-    pub unsafe fn update_ep0_max_packet_size(
-        &mut self,
-        slot_id: u8,
-        max_packet_size: u16,
-    ) -> bool {
-        self.evaluate_ep0_max_packet(slot_id, max_packet_size)
-    }
-
-    /*
-     * ======================================================================
-     * Synchronous USB control transfer
-     * ======================================================================
-     *
-     * The setup packet is eight bytes in USB little-endian field order.
-     * xHCI Setup Stage uses the eight-byte setup packet as immediate data.
-     * ======================================================================
-     */
-
-    pub unsafe fn control_transfer_in(
-        &mut self,
-        slot_id: u8,
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        data: &mut [u8],
-    ) -> Option<usize> {
-        self.control_transfer(slot_id, request_type, request, value, index, Some(data))
-    }
-
-    pub unsafe fn control_transfer_out(
-        &mut self,
-        slot_id: u8,
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-    ) -> bool {
-        self.control_transfer(slot_id, request_type, request, value, index, None).is_some()
-    }
-
-    unsafe fn control_transfer(
-        &mut self,
-        slot_id: u8,
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        data_in: Option<&mut [u8]>,
-    ) -> Option<usize> {
-        let slot = slot_id as usize;
-        if slot == 0 || slot >= self.ep0_rings.len() {
-            return None;
-        }
-
-        if !self.ensure_ep0_ring(slot_id) {
-            return None;
-        }
-
-        let mut data_phys = 0u64;
-        let mut data_virt = 0usize;
-        let data_len = data_in.as_ref().map_or(0, |buffer| buffer.len());
-
-        if data_len != 0 {
-            data_phys = memory::allocate_dma_region(data_len, 64, None)?;
-            data_virt = memory::physical_to_virtual(data_phys) as usize;
-            if data_virt == 0 {
-                return None;
-            }
-
-            if let Some(buffer) = data_in.as_ref() {
-                /* Zero first so a short transfer cannot expose old data. */
-                write_bytes(data_virt as *mut u8, 0, data_len);
-                dma_sync_for_device(data_virt as *const u8, data_len);
-                let _ = buffer;
-            }
-        }
-
-        let ring = self.ep0_rings[slot].as_mut()?;
-
-        let setup_value =
-            request_type as u64
-            | ((request as u64) << 8)
-            | ((value as u64) << 16)
-            | ((index as u64) << 32)
-            | ((data_len as u64 & 0xFFFF) << 48);
-
-        let mut setup = Trb::new(
-            setup_value,
-            8,
-            (TrbType::SetupStage as u32) << 10,
-        );
-        setup.set_immediate_data(true);
-        setup.set_chain(true);
-        setup.set_transfer_type(if data_len == 0 {
-            0
-        } else {
-            2
-        });
-
-        let _setup_phys = ring.push(setup);
-
-        if data_len != 0 {
-            let mut data_trb = Trb::new(
-                data_phys,
-                data_len as u32,
-                (TrbType::DataStage as u32) << 10,
-            );
-            data_trb.set_direction_in(true);
-            data_trb.set_chain(true);
-            ring.push(data_trb);
-        }
-
-        let mut status_trb = Trb::new(
-            0,
-            0,
-            (TrbType::StatusStage as u32) << 10,
-        );
-        status_trb.set_direction_in(data_len == 0);
-        status_trb.set_interrupt_on_completion(true);
-        let status_phys = ring.push(status_trb);
-
-        dma_sync_for_device(
-            ring.buffer.as_ptr() as *const u8,
-            ring.size * XHCI_TRB_SIZE,
-        );
-        fence(Ordering::SeqCst);
-
-        self.regs.ring_doorbell(slot_id, 1);
-
-        let deadline = crate::delay::now_us().saturating_add(1_000_000);
-
-        loop {
-            self.poll_events();
-
-            if let Some(completion) = self.take_transfer_completion_for(status_phys) {
-                if completion.completion_code != 1 && completion.completion_code != 13 {
-                    crate::serial::write_str("xHCI: control transfer failed code=");
-                    crate::serial::write_hex(completion.completion_code as u64);
-                    crate::serial::write_str(" slot=");
-                    crate::serial::write_hex(slot_id as u64);
-                    crate::serial::write_str("\n");
-                    return None;
-                }
-
-                let actual = data_len.saturating_sub(completion.transfer_length as usize).min(data_len);
-
-                if let Some(buffer) = data_in {
-                    dma_sync_for_cpu(data_virt as *const u8, data_len);
-                    core::ptr::copy_nonoverlapping(
-                        data_virt as *const u8,
-                        buffer.as_mut_ptr(),
-                        actual,
-                    );
-                }
-
-                return Some(actual);
-            }
-
-            if crate::delay::now_us() >= deadline {
-                crate::serial::write_str("xHCI: control transfer timeout slot=");
-                crate::serial::write_hex(slot_id as u64);
-                crate::serial::write_str("\n");
-                return None;
-            }
-
-            crate::delay::delay_us(XHCI_POLL_INTERVAL_US);
-        }
-    }
-
-    /*
-     * ======================================================================
-     * Configure one interrupt-IN endpoint
-     * ======================================================================
-     */
-
-    pub unsafe fn configure_interrupt_in_endpoint(
-        &mut self,
-        slot_id: u8,
-        endpoint_address: u8,
-        packet_size: u16,
-        interval: u8,
-        speed: u8,
-    ) -> bool {
-        let slot = slot_id as usize;
-        if slot == 0 || slot > self.max_slots {
-            return false;
-        }
-
-        if endpoint_address & 0x80 == 0 {
-            return false;
-        }
-
-        let endpoint_number = endpoint_address & 0x0F;
-        if endpoint_number == 0 || endpoint_number > 15 {
-            return false;
-        }
-
-        let endpoint_id = endpoint_number
-            .saturating_mul(2)
-            .saturating_add(1);
-
-        if endpoint_id > 31 || packet_size == 0 || packet_size > 1024 {
-            return false;
-        }
-
-        if self.input_context_phys[slot] == 0 || self.input_context_virt[slot] == 0 {
-            return false;
-        }
-
-        /* Each configured endpoint gets one 256-TRB transfer ring. */
-        let ring = Ring::new(COMMAND_RING_TRBS);
-        let ring_phys = ring.phys_addr;
-
-        let buffer_size = packet_size as usize;
-        let buffer_phys = match memory::allocate_dma_region(buffer_size, 64, None) {
-            Some(value) => value,
-            None => return false,
-        };
-        let buffer_virt = memory::physical_to_virtual(buffer_phys) as usize;
-        if buffer_virt == 0 {
-            return false;
-        }
-        write_bytes(buffer_virt as *mut u8, 0, buffer_size);
-        dma_sync_for_device(buffer_virt as *const u8, buffer_size);
-
-        let stride = self.context_size;
-        let input_virt = self.input_context_virt[slot];
-        let input_phys = self.input_context_phys[slot];
-        let output_virt = self.device_context_virt[slot];
-
-        if output_virt == 0 {
-            return false;
-        }
-
-        let input_control = input_virt;
-        let input_slot = input_virt + stride;
-        let input_ep = input_slot + stride * endpoint_id as usize;
-        let output_slot = output_virt;
-        let output_ep = output_virt + stride * endpoint_id as usize;
-
-        /* Input Control: Slot + this endpoint. */
-        write_volatile(input_control as *mut u32, 0);
-        write_volatile(
-            (input_control + 4) as *mut u32,
-            1u32 | (1u32 << endpoint_id),
-        );
-
-        /* Copy the current output Slot Context. */
-        for index in 0..(stride / 4).min(8) {
-            let value = read_volatile((output_slot + index * 4) as *const u32);
-            write_volatile((input_slot + index * 4) as *mut u32, value);
-        }
-
-        /* LAST_CTX becomes the highest endpoint context being supplied. */
-        let mut slot_dword0 = read_volatile(input_slot as *const u32);
-        slot_dword0 &= !(0x1Fu32 << 27);
-        slot_dword0 |= (endpoint_id as u32) << 27;
-        write_volatile(input_slot as *mut u32, slot_dword0);
-
-        /* Zero the new endpoint context; no endpoint state is supplied by SW. */
-        for index in 0..(stride / 4) {
-            write_volatile((input_ep + index * 4) as *mut u32, 0);
-        }
-
-        /* Interval field is expressed as log2(125 us units). */
-        let interval_field = if speed >= 3 {
-            interval.saturating_sub(1).min(15)
-        } else {
-            let mut requested = (interval.max(1) as u32).saturating_mul(8);
-            let mut exponent = 0u8;
-            let mut quantum = 1u32;
-
-            while quantum < requested && exponent < 15 {
-                quantum <<= 1;
-                exponent += 1;
-            }
-
-            requested = quantum;
-            let _ = requested;
-            exponent
-        };
-
-        let ep_info = (interval_field as u32) << 16;
-        let ep_info2 =
-            (3u32 << 1)
-            | (7u32 << 3)
-            | (((packet_size as u32) & 0xFFFF) << 16);
-
-        write_volatile(input_ep as *mut u32, ep_info);
-        write_volatile((input_ep + 4) as *mut u32, ep_info2);
-        write_volatile((input_ep + 8) as *mut u64, ring_phys | 1);
-        write_volatile((input_ep + 16) as *mut u32, packet_size as u32);
-
-        dma_sync_for_device(input_virt as *const u8, stride * (endpoint_id as usize + 2));
-        fence(Ordering::SeqCst);
-
-        let mut command = Trb::new(
-            input_phys,
-            0,
-            (TrbType::ConfigureEndpointCommand as u32) << 10,
-        );
-        command.set_slot_id(slot_id);
-
-        let Some(completion) = self.submit_command_wait(command, None, 1_000_000) else {
-            return false;
-        };
-
-        if completion.completion_code != 1 {
-            crate::serial::write_str("xHCI: Configure Endpoint failed code=");
-            crate::serial::write_hex(completion.completion_code as u64);
-            crate::serial::write_str(" slot=");
-            crate::serial::write_hex(slot_id as u64);
-            crate::serial::write_str(" ep=");
-            crate::serial::write_hex(endpoint_id as u64);
-            crate::serial::write_str("\n");
-            return false;
-        }
-
-        self.interrupt_endpoints.push(InterruptEndpoint {
-            slot_id,
-            endpoint_id,
-            ring,
-            buffer_phys,
-            buffer_virt,
-            packet_size: buffer_size,
-        });
-
-        crate::serial::write_str("xHCI: interrupt-IN endpoint configured slot=");
-        crate::serial::write_hex(slot_id as u64);
-        crate::serial::write_str(" address=0x");
-        crate::serial::write_hex(endpoint_address as u64);
-        crate::serial::write_str(" ep_id=");
         crate::serial::write_hex(endpoint_id as u64);
-        crate::serial::write_str(" mps=");
-        crate::serial::write_hex(packet_size as u64);
-        crate::serial::write_str(" interval=");
-        crate::serial::write_hex(interval_field as u64);
+
+        crate::serial::write_str(" length=");
+
+        crate::serial::write_hex(transfer_length as u64);
+
+        crate::serial::write_str(" ptr=0x");
+
+        crate::serial::write_hex(trb.parameter);
+
         crate::serial::write_str("\n");
-
-        true
     }
-
-    /*
-     * ======================================================================
-     * Submit one persistent interrupt-IN transfer
-     * ======================================================================
-     */
-
-    pub unsafe fn submit_interrupt_in(&mut self, slot_id: u8, endpoint_id: u8) -> bool {
-        let index = match self
-            .interrupt_endpoints
-            .iter()
-            .position(|endpoint| endpoint.slot_id == slot_id && endpoint.endpoint_id == endpoint_id)
-        {
-            Some(index) => index,
-            None => return false,
-        };
-
-        let endpoint = &mut self.interrupt_endpoints[index];
-
-        write_bytes(
-            endpoint.buffer_virt as *mut u8,
-            0,
-            endpoint.packet_size,
-        );
-        dma_sync_for_device(
-            endpoint.buffer_virt as *const u8,
-            endpoint.packet_size,
-        );
-
-        let mut trb = Trb::new(
-            endpoint.buffer_phys,
-            endpoint.packet_size as u32,
-            (TrbType::Normal as u32) << 10,
-        );
-        trb.set_interrupt_on_short_packet(true);
-        trb.set_interrupt_on_completion(true);
-
-        let trb_phys = endpoint.ring.push(trb);
-
-        dma_sync_for_device(
-            endpoint.ring.buffer.as_ptr() as *const u8,
-            endpoint.ring.size * XHCI_TRB_SIZE,
-        );
-        fence(Ordering::SeqCst);
-
-        let slot_db = endpoint.slot_id;
-        let ep_db = endpoint.endpoint_id;
-
-        self.regs.ring_doorbell(slot_db, ep_db);
-
-        true
-    }
-
-    pub fn copy_interrupt_report(
-        &self,
-        slot_id: u8,
-        endpoint_id: u8,
-        destination: &mut [u8],
-    ) -> Option<usize> {
-        let endpoint = self
-            .interrupt_endpoints
-            .iter()
-            .find(|endpoint| endpoint.slot_id == slot_id && endpoint.endpoint_id == endpoint_id)?;
-
-        let length = destination.len().min(endpoint.packet_size);
-
-        unsafe {
-            dma_sync_for_cpu(
-                endpoint.buffer_virt as *const u8,
-                endpoint.packet_size,
-            );
-            core::ptr::copy_nonoverlapping(
-                endpoint.buffer_virt as *const u8,
-                destination.as_mut_ptr(),
-                length,
-            );
-        }
-
-        Some(length)
-    }
-
-    pub fn has_interrupt_endpoint(&self, slot_id: u8, endpoint_id: u8) -> bool {
-        self.interrupt_endpoints
-            .iter()
-            .any(|endpoint| endpoint.slot_id == slot_id && endpoint.endpoint_id == endpoint_id)
-    }
-
 
     /*
      * ======================================================================

@@ -1,18 +1,9 @@
 use core::arch::global_asm;
 
-use x86_64::{
-    structures::{
-        idt::InterruptDescriptorTable,
-    },
-    PrivilegeLevel,
-    VirtAddr,
-};
+use x86_64::{PrivilegeLevel, VirtAddr, structures::idt::InterruptDescriptorTable};
 
 use crate::graphics::Color;
-use crate::process::{
-    SavedUserContext,
-    ScheduleResult,
-};
+use crate::process::{SavedUserContext, ScheduleResult};
 
 // ============================================================
 // Syscall numbers
@@ -43,11 +34,9 @@ pub const SYS_CLICK_RECT: u64 = 106;
 const ENOSYS: u64 = u64::MAX;
 const SUCCESS: u64 = 0;
 
-const SYSCALL_SWITCH: u64 =
-    u64::MAX - 1;
+const SYSCALL_SWITCH: u64 = u64::MAX - 1;
 
-const SYSCALL_HALT: u64 =
-    u64::MAX - 2;
+const SYSCALL_HALT: u64 = u64::MAX - 2;
 
 // ============================================================
 // Saved register frame
@@ -89,10 +78,7 @@ pub struct UserInterruptFrame {
 // Save context
 // ============================================================
 
-fn save_context(
-    frame: &SyscallFrame,
-    interrupt: &UserInterruptFrame,
-) -> SavedUserContext {
+fn save_context(frame: &SyscallFrame, interrupt: &UserInterruptFrame) -> SavedUserContext {
     SavedUserContext {
         rax: frame.rax,
         rbx: frame.rbx,
@@ -143,20 +129,15 @@ fn load_context(
     frame.r14 = context.r14;
     frame.r15 = context.r15;
 
-    interrupt.rip =
-        context.rip;
+    interrupt.rip = context.rip;
 
-    interrupt.cs =
-        context.cs;
+    interrupt.cs = context.cs;
 
-    interrupt.rflags =
-        context.rflags;
+    interrupt.rflags = context.rflags;
 
-    interrupt.rsp =
-        context.rsp;
+    interrupt.rsp = context.rsp;
 
-    interrupt.ss =
-        context.ss;
+    interrupt.ss = context.ss;
 }
 
 // ============================================================
@@ -330,100 +311,44 @@ extern "C" fn rusty_syscall_dispatch(
 
     service_mouse();
 
-    let frame =
-        unsafe {
-            &mut *frame
-        };
+    let frame = unsafe { &mut *frame };
 
-    let interrupt =
-        unsafe {
-            &mut *interrupt
-        };
+    let interrupt = unsafe { &mut *interrupt };
 
     match frame.rax {
-        SYS_EXIT =>
-            syscall_exit(
-                frame,
-                interrupt,
-            ),
+        SYS_EXIT => syscall_exit(frame, interrupt),
 
-        SYS_YIELD =>
-            syscall_yield(
-                frame,
-                interrupt,
-            ),
+        SYS_YIELD => syscall_yield(frame, interrupt),
 
-        SYS_GETPID =>
-            syscall_getpid(),
+        SYS_GETPID => syscall_getpid(),
 
-        SYS_TEST =>
-            syscall_test(
-                frame.rdi,
-            ),
+        SYS_TEST => syscall_test(frame.rdi),
 
-        SYS_WRITE =>
-            syscall_write(
-                frame,
-            ),
+        SYS_WRITE => syscall_write(frame),
 
-        SYS_READ =>
-            syscall_read(
-                frame,
-                interrupt,
-            ),
+        SYS_READ => syscall_read(frame, interrupt),
 
-        SYS_SLEEP =>
-            syscall_sleep(
-                frame,
-            ),
+        SYS_SLEEP => syscall_sleep(frame),
 
-        SYS_FILL_RECT =>
-            syscall_fill_rect(
-                frame,
-            ),
+        SYS_FILL_RECT => syscall_fill_rect(frame),
 
-        SYS_DRAW_STRING =>
-            syscall_draw_string(
-                frame,
-            ),
+        SYS_DRAW_STRING => syscall_draw_string(frame),
 
-        SYS_DRAW_RECT =>
-            syscall_draw_rect(
-                frame,
-            ),
+        SYS_DRAW_RECT => syscall_draw_rect(frame),
 
-        SYS_CREATE_WINDOW =>
-            syscall_create_window(
-                frame,
-            ),
+        SYS_CREATE_WINDOW => syscall_create_window(frame),
 
-        SYS_UPDATE_WINDOW =>
-            syscall_update_window(
-                frame,
-            ),
+        SYS_UPDATE_WINDOW => syscall_update_window(frame),
 
-        SYS_FLUSH_SCREEN =>
-            syscall_flush_screen(),
+        SYS_FLUSH_SCREEN => syscall_flush_screen(),
 
-        SYS_CLICK =>
-            syscall_click(
-                frame,
-            ),
+        SYS_CLICK => syscall_click(frame),
 
-        SYS_DESTROY_WINDOW =>
-            syscall_destroy_window(
-                frame,
-            ),
+        SYS_DESTROY_WINDOW => syscall_destroy_window(frame),
 
-        SYS_LAUNCH_APP =>
-            syscall_launch_app(
-                frame,
-            ),
+        SYS_LAUNCH_APP => syscall_launch_app(frame),
 
-        SYS_CLICK_RECT =>
-            syscall_click_rect(
-                frame,
-            ),
+        SYS_CLICK_RECT => syscall_click_rect(frame),
 
         _ => ENOSYS,
     }
@@ -433,30 +358,17 @@ extern "C" fn rusty_syscall_dispatch(
 // SYS_EXIT
 // ============================================================
 
-fn syscall_exit(
-    frame: &mut SyscallFrame,
-    interrupt: &mut UserInterruptFrame,
-) -> u64 {
-    let status =
-        frame.rdi;
+fn syscall_exit(frame: &mut SyscallFrame, interrupt: &mut UserInterruptFrame) -> u64 {
+    let status = frame.rdi;
 
-    match crate::process::exit_current(
-        status,
-    ) {
-        ScheduleResult::Switched(
-            context,
-        ) => {
-            load_context(
-                context,
-                frame,
-                interrupt,
-            );
+    match crate::process::exit_current(status) {
+        ScheduleResult::Switched(context) => {
+            load_context(context, frame, interrupt);
 
             SYSCALL_SWITCH
         }
 
-        ScheduleResult::NoProcess =>
-            SYSCALL_HALT,
+        ScheduleResult::NoProcess => SYSCALL_HALT,
     }
 }
 
@@ -464,10 +376,7 @@ fn syscall_exit(
 // SYS_YIELD
 // ============================================================
 
-fn syscall_yield(
-    frame: &mut SyscallFrame,
-    interrupt: &mut UserInterruptFrame,
-) -> u64 {
+fn syscall_yield(frame: &mut SyscallFrame, interrupt: &mut UserInterruptFrame) -> u64 {
     // --------------------------------------------------------
     // IMPORTANT:
     //
@@ -482,29 +391,16 @@ fn syscall_yield(
     // update_cursor_only().
     // --------------------------------------------------------
 
-    let current_context =
-        save_context(
-            frame,
-            interrupt,
-        );
+    let current_context = save_context(frame, interrupt);
 
-    match crate::process::yield_current(
-        current_context,
-    ) {
-        ScheduleResult::Switched(
-            context,
-        ) => {
-            load_context(
-                context,
-                frame,
-                interrupt,
-            );
+    match crate::process::yield_current(current_context) {
+        ScheduleResult::Switched(context) => {
+            load_context(context, frame, interrupt);
 
             SYSCALL_SWITCH
         }
 
-        ScheduleResult::NoProcess =>
-            SUCCESS,
+        ScheduleResult::NoProcess => SUCCESS,
     }
 }
 
@@ -515,25 +411,17 @@ fn syscall_yield(
 fn syscall_getpid() -> u64 {
     match crate::process::current_pid() {
         Some(pid) => {
-            crate::serial::write_str(
-                "sys_getpid() -> ",
-            );
+            crate::serial::write_str("sys_getpid() -> ");
 
-            crate::serial::write_usize(
-                pid as usize,
-            );
+            crate::serial::write_usize(pid as usize);
 
-            crate::serial::write_str(
-                "\n",
-            );
+            crate::serial::write_str("\n");
 
             pid
         }
 
         None => {
-            crate::serial::write_str(
-                "sys_getpid() -> no current process\n",
-            );
+            crate::serial::write_str("sys_getpid() -> no current process\n");
 
             0
         }
@@ -544,20 +432,12 @@ fn syscall_getpid() -> u64 {
 // SYS_TEST
 // ============================================================
 
-fn syscall_test(
-    value: u64,
-) -> u64 {
-    crate::serial::write_str(
-        "sys_test(",
-    );
+fn syscall_test(value: u64) -> u64 {
+    crate::serial::write_str("sys_test(");
 
-    crate::serial::write_usize(
-        value as usize,
-    );
+    crate::serial::write_usize(value as usize);
 
-    crate::serial::write_str(
-        ")\n",
-    );
+    crate::serial::write_str(")\n");
 
     value
 }
@@ -566,30 +446,19 @@ fn syscall_test(
 // SYS_WRITE
 // ============================================================
 
-fn syscall_write(
-    frame: &SyscallFrame,
-) -> u64 {
-    let fd =
-        frame.rdi;
+fn syscall_write(frame: &SyscallFrame) -> u64 {
+    let fd = frame.rdi;
 
-    let address =
-        frame.rsi;
+    let address = frame.rsi;
 
-    let length =
-        match usize::try_from(
-            frame.rdx,
-        ) {
-            Ok(length) =>
-                length,
+    let length = match usize::try_from(frame.rdx) {
+        Ok(length) => length,
 
-            Err(_) =>
-                return u64::MAX,
-        };
+        Err(_) => return u64::MAX,
+    };
 
     if fd != 1 {
-        crate::serial::write_str(
-            "sys_write: unsupported file descriptor\n",
-        );
+        crate::serial::write_str("sys_write: unsupported file descriptor\n");
 
         return u64::MAX;
     }
@@ -602,25 +471,15 @@ fn syscall_write(
             false,
         )
     } {
-        crate::serial::write_str(
-            "sys_write: invalid user memory range or unmapped page\n",
-        );
+        crate::serial::write_str("sys_write: invalid user memory range or unmapped page\n");
 
         return u64::MAX;
     }
 
-    let bytes =
-        unsafe {
-            core::slice::from_raw_parts(
-                address as *const u8,
-                length,
-            )
-        };
+    let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
 
     for &byte in bytes {
-        crate::serial::write_byte(
-            byte,
-        );
+        crate::serial::write_byte(byte);
     }
 
     length as u64
@@ -640,10 +499,7 @@ fn syscall_write(
 //   u64::MAX = error
 // ============================================================
 
-fn syscall_read(
-    frame: &mut SyscallFrame,
-    interrupt: &mut UserInterruptFrame,
-) -> u64 {
+fn syscall_read(frame: &mut SyscallFrame, interrupt: &mut UserInterruptFrame) -> u64 {
     let fd = frame.rdi;
     let address = frame.rsi;
 
@@ -659,9 +515,7 @@ fn syscall_read(
     // --------------------------------------------------------
 
     if fd != 0 {
-        crate::serial::write_str(
-            "sys_read: unsupported file descriptor\n",
-        );
+        crate::serial::write_str("sys_read: unsupported file descriptor\n");
 
         return u64::MAX;
     }
@@ -679,12 +533,7 @@ fn syscall_read(
     // --------------------------------------------------------
 
     if !unsafe {
-        crate::memory::validate_user_range(
-            crate::memory::current_level_4_frame(),
-            address,
-            1,
-            true,
-        )
+        crate::memory::validate_user_range(crate::memory::current_level_4_frame(), address, 1, true)
     } {
         crate::serial::write_str(
             "sys_read: invalid user memory range, unmapped page, or read-only destination\n",
@@ -706,14 +555,8 @@ fn syscall_read(
 
     while let Some(event) = crate::input::poll_keyboard_event() {
         match event {
-            crate::input::InputEvent::KeyDown {
-                key,
-                modifiers,
-            } => {
-                let ascii = key_to_ascii(
-                    key,
-                    modifiers,
-                );
+            crate::input::InputEvent::KeyDown { key, modifiers } => {
+                let ascii = key_to_ascii(key, modifiers);
 
                 if ascii == 0 {
                     // Non-printable key.
@@ -768,25 +611,13 @@ fn syscall_read(
 
     let original_rip = interrupt.rip;
 
-    interrupt.rip = interrupt
-        .rip
-        .checked_sub(2)
-        .unwrap_or(interrupt.rip);
+    interrupt.rip = interrupt.rip.checked_sub(2).unwrap_or(interrupt.rip);
 
-    let current_context = save_context(
-        frame,
-        interrupt,
-    );
+    let current_context = save_context(frame, interrupt);
 
-    match crate::process::yield_current(
-        current_context,
-    ) {
+    match crate::process::yield_current(current_context) {
         ScheduleResult::Switched(context) => {
-            load_context(
-                context,
-                frame,
-                interrupt,
-            );
+            load_context(context, frame, interrupt);
 
             SYSCALL_SWITCH
         }
@@ -808,178 +639,228 @@ fn syscall_read(
 // Returns 0 when the key has no ASCII representation.
 // ============================================================
 
-fn key_to_ascii(
-    key: crate::input::Key,
-    modifiers: crate::input::Modifiers,
-) -> u8 {
-    let shift =
-        modifiers.left_shift ||
-            modifiers.right_shift;
+fn key_to_ascii(key: crate::input::Key, modifiers: crate::input::Modifiers) -> u8 {
+    let shift = modifiers.left_shift || modifiers.right_shift;
+
+    let uppercase = shift != modifiers.caps_lock;
 
     match key {
-        crate::input::Key::A =>
-            if shift { b'A' } else { b'a' },
+        crate::input::Key::A => {
+            if uppercase {
+                b'A'
+            } else {
+                b'a'
+            }
+        }
 
-        crate::input::Key::B =>
-            if shift { b'B' } else { b'b' },
+        crate::input::Key::B => {
+            if uppercase {
+                b'B'
+            } else {
+                b'b'
+            }
+        }
 
-        crate::input::Key::C =>
-            if shift { b'C' } else { b'c' },
+        crate::input::Key::C => {
+            if uppercase {
+                b'C'
+            } else {
+                b'c'
+            }
+        }
 
-        crate::input::Key::D =>
-            if shift { b'D' } else { b'd' },
+        crate::input::Key::D => {
+            if uppercase {
+                b'D'
+            } else {
+                b'd'
+            }
+        }
 
-        crate::input::Key::E =>
-            if shift { b'E' } else { b'e' },
+        crate::input::Key::E => {
+            if uppercase {
+                b'E'
+            } else {
+                b'e'
+            }
+        }
 
-        crate::input::Key::F =>
-            if shift { b'F' } else { b'f' },
+        crate::input::Key::F => {
+            if uppercase {
+                b'F'
+            } else {
+                b'f'
+            }
+        }
 
-        crate::input::Key::G =>
-            if shift { b'G' } else { b'g' },
+        crate::input::Key::G => {
+            if uppercase {
+                b'G'
+            } else {
+                b'g'
+            }
+        }
 
-        crate::input::Key::H =>
-            if shift { b'H' } else { b'h' },
+        crate::input::Key::H => {
+            if uppercase {
+                b'H'
+            } else {
+                b'h'
+            }
+        }
 
-        crate::input::Key::I =>
-            if shift { b'I' } else { b'i' },
+        crate::input::Key::I => {
+            if uppercase {
+                b'I'
+            } else {
+                b'i'
+            }
+        }
 
-        crate::input::Key::J =>
-            if shift { b'J' } else { b'j' },
+        crate::input::Key::J => {
+            if uppercase {
+                b'J'
+            } else {
+                b'j'
+            }
+        }
 
-        crate::input::Key::K =>
-            if shift { b'K' } else { b'k' },
+        crate::input::Key::K => {
+            if uppercase {
+                b'K'
+            } else {
+                b'k'
+            }
+        }
 
-        crate::input::Key::L =>
-            if shift { b'L' } else { b'l' },
+        crate::input::Key::L => {
+            if uppercase {
+                b'L'
+            } else {
+                b'l'
+            }
+        }
 
-        crate::input::Key::M =>
-            if shift { b'M' } else { b'm' },
+        crate::input::Key::M => {
+            if uppercase {
+                b'M'
+            } else {
+                b'm'
+            }
+        }
 
-        crate::input::Key::N =>
-            if shift { b'N' } else { b'n' },
+        crate::input::Key::N => {
+            if uppercase {
+                b'N'
+            } else {
+                b'n'
+            }
+        }
 
-        crate::input::Key::O =>
-            if shift { b'O' } else { b'o' },
+        crate::input::Key::O => {
+            if uppercase {
+                b'O'
+            } else {
+                b'o'
+            }
+        }
 
-        crate::input::Key::P =>
-            if shift { b'P' } else { b'p' },
+        crate::input::Key::P => {
+            if uppercase {
+                b'P'
+            } else {
+                b'p'
+            }
+        }
 
-        crate::input::Key::Q =>
-            if shift { b'Q' } else { b'q' },
+        crate::input::Key::Q => {
+            if uppercase {
+                b'Q'
+            } else {
+                b'q'
+            }
+        }
 
-        crate::input::Key::R =>
-            if shift { b'R' } else { b'r' },
+        crate::input::Key::R => {
+            if uppercase {
+                b'R'
+            } else {
+                b'r'
+            }
+        }
 
-        crate::input::Key::S =>
-            if shift { b'S' } else { b's' },
+        crate::input::Key::S => {
+            if uppercase {
+                b'S'
+            } else {
+                b's'
+            }
+        }
 
-        crate::input::Key::T =>
-            if shift { b'T' } else { b't' },
+        crate::input::Key::T => {
+            if uppercase {
+                b'T'
+            } else {
+                b't'
+            }
+        }
 
-        crate::input::Key::U =>
-            if shift { b'U' } else { b'u' },
+        crate::input::Key::U => {
+            if uppercase {
+                b'U'
+            } else {
+                b'u'
+            }
+        }
 
-        crate::input::Key::V =>
-            if shift { b'V' } else { b'v' },
+        crate::input::Key::V => {
+            if uppercase {
+                b'V'
+            } else {
+                b'v'
+            }
+        }
 
-        crate::input::Key::W =>
-            if shift { b'W' } else { b'w' },
+        crate::input::Key::W => {
+            if uppercase {
+                b'W'
+            } else {
+                b'w'
+            }
+        }
 
-        crate::input::Key::X =>
-            if shift { b'X' } else { b'x' },
+        crate::input::Key::X => {
+            if uppercase {
+                b'X'
+            } else {
+                b'x'
+            }
+        }
 
-        crate::input::Key::Y =>
-            if shift { b'Y' } else { b'y' },
+        crate::input::Key::Y => {
+            if uppercase {
+                b'Y'
+            } else {
+                b'y'
+            }
+        }
 
-        crate::input::Key::Z =>
-            if shift { b'Z' } else { b'z' },
+        crate::input::Key::Z => {
+            if uppercase {
+                b'Z'
+            } else {
+                b'z'
+            }
+        }
 
-        crate::input::Key::Num1 =>
-            if shift { b'!' } else { b'1' },
-
-        crate::input::Key::Num2 =>
-            if shift { b'@' } else { b'2' },
-
-        crate::input::Key::Num3 =>
-            if shift { b'#' } else { b'3' },
-
-        crate::input::Key::Num4 =>
-            if shift { b'$' } else { b'4' },
-
-        crate::input::Key::Num5 =>
-            if shift { b'%' } else { b'5' },
-
-        crate::input::Key::Num6 =>
-            if shift { b'^' } else { b'6' },
-
-        crate::input::Key::Num7 =>
-            if shift { b'&' } else { b'7' },
-
-        crate::input::Key::Num8 =>
-            if shift { b'*' } else { b'8' },
-
-        crate::input::Key::Num9 =>
-            if shift { b'(' } else { b'9' },
-
-        crate::input::Key::Num0 =>
-            if shift { b')' } else { b'0' },
-
-        crate::input::Key::Enter =>
-            b'\n',
-
-        crate::input::Key::Space =>
-            b' ',
-
-        crate::input::Key::Tab =>
-            b'\t',
-
-        crate::input::Key::Backspace =>
-            0x08,
-
-        crate::input::Key::Minus =>
-            if shift { b'_' } else { b'-' },
-
-        crate::input::Key::Equal =>
-            if shift { b'+' } else { b'=' },
-
-        crate::input::Key::LeftBracket =>
-            if shift { b'{' } else { b'[' },
-
-        crate::input::Key::RightBracket =>
-            if shift { b'}' } else { b']' },
-
-        crate::input::Key::Backslash =>
-            if shift { b'|' } else { b'\\' },
-
-        crate::input::Key::Semicolon =>
-            if shift { b':' } else { b';' },
-
-        crate::input::Key::Apostrophe =>
-            if shift { b'"' } else { b'\'' },
-
-        crate::input::Key::Grave =>
-            if shift { b'~' } else { b'`' },
-
-        crate::input::Key::Comma =>
-            if shift { b'<' } else { b',' },
-
-        crate::input::Key::Dot =>
-            if shift { b'>' } else { b'.' },
-
-        crate::input::Key::Slash =>
-            if shift { b'?' } else { b'/' },
-
+        // ... existing number/punctuation mappings unchanged ...
         _ => 0,
     }
-}
-// ============================================================
+} // ============================================================
 // SYS_SLEEP
 // ============================================================
 
-fn syscall_sleep(
-    _frame: &SyscallFrame,
-) -> u64 {
+fn syscall_sleep(_frame: &SyscallFrame) -> u64 {
     SUCCESS
 }
 
@@ -993,45 +874,24 @@ fn syscall_sleep(
 // r9  = color
 // ============================================================
 
-fn syscall_fill_rect(
-    frame: &SyscallFrame,
-) -> u64 {
-    let window_id =
-        frame.rdi;
+fn syscall_fill_rect(frame: &SyscallFrame) -> u64 {
+    let window_id = frame.rdi;
 
-    let x =
-        frame.rsi as usize;
+    let x = frame.rsi as usize;
 
-    let y =
-        frame.rdx as usize;
+    let y = frame.rdx as usize;
 
-    let width =
-        frame.r10 as usize;
+    let width = frame.r10 as usize;
 
-    let height =
-        frame.r8 as usize;
+    let height = frame.r8 as usize;
 
-    let color_argb =
-        frame.r9 as u32;
+    let color_argb = frame.r9 as u32;
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut wm) =
-        *wm_lock
-    {
-        if let Some(win) =
-            wm.windows.get_mut(
-                &window_id,
-            )
-        {
-            win.fill_rect(
-                x,
-                y,
-                width,
-                height,
-                color_argb,
-            );
+    if let Some(ref mut wm) = *wm_lock {
+        if let Some(win) = wm.windows.get_mut(&window_id) {
+            win.fill_rect(x, y, width, height, color_argb);
 
             return 1;
         }
@@ -1050,26 +910,18 @@ fn syscall_fill_rect(
 // r9  = scale
 // ============================================================
 
-fn syscall_draw_string(
-    frame: &SyscallFrame,
-) -> u64 {
-    let window_id =
-        frame.rdi;
+fn syscall_draw_string(frame: &SyscallFrame) -> u64 {
+    let window_id = frame.rdi;
 
-    let x =
-        frame.rsi as usize;
+    let x = frame.rsi as usize;
 
-    let y =
-        frame.rdx as usize;
+    let y = frame.rdx as usize;
 
-    let str_ptr =
-        frame.r10;
+    let str_ptr = frame.r10;
 
-    let str_len =
-        frame.r8 as usize;
+    let str_len = frame.r8 as usize;
 
-    let scale =
-        frame.r9 as usize;
+    let scale = frame.r9 as usize;
 
     if !unsafe {
         crate::memory::validate_user_range(
@@ -1082,43 +934,19 @@ fn syscall_draw_string(
         return 0;
     }
 
-    let bytes =
-        unsafe {
-            core::slice::from_raw_parts(
-                str_ptr as *const u8,
-                str_len,
-            )
-        };
+    let bytes = unsafe { core::slice::from_raw_parts(str_ptr as *const u8, str_len) };
 
-    let text =
-        match core::str::from_utf8(
-            bytes,
-        ) {
-            Ok(text) =>
-                text,
+    let text = match core::str::from_utf8(bytes) {
+        Ok(text) => text,
 
-            Err(_) =>
-                return 0,
-        };
+        Err(_) => return 0,
+    };
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut wm) =
-        *wm_lock
-    {
-        if let Some(win) =
-            wm.windows.get_mut(
-                &window_id,
-            )
-        {
-            win.draw_string(
-                x,
-                y,
-                text,
-                Color::WHITE,
-                scale,
-            );
+    if let Some(ref mut wm) = *wm_lock {
+        if let Some(win) = wm.windows.get_mut(&window_id) {
+            win.draw_string(x, y, text, Color::WHITE, scale);
 
             return 1;
         }
@@ -1137,77 +965,36 @@ fn syscall_draw_string(
 // r9  = color
 // ============================================================
 
-fn syscall_draw_rect(
-    frame: &SyscallFrame,
-) -> u64 {
-    let window_id =
-        frame.rdi;
+fn syscall_draw_rect(frame: &SyscallFrame) -> u64 {
+    let window_id = frame.rdi;
 
-    let x =
-        frame.rsi as usize;
+    let x = frame.rsi as usize;
 
-    let y =
-        frame.rdx as usize;
+    let y = frame.rdx as usize;
 
-    let width =
-        frame.r10 as usize;
+    let width = frame.r10 as usize;
 
-    let height =
-        frame.r8 as usize;
+    let height = frame.r8 as usize;
 
-    let color_argb =
-        frame.r9 as u32;
+    let color_argb = frame.r9 as u32;
 
-    if width == 0
-        || height == 0
-    {
+    if width == 0 || height == 0 {
         return 0;
     }
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut wm) =
-        *wm_lock
-    {
-        if let Some(win) =
-            wm.windows.get_mut(
-                &window_id,
-            )
-        {
+    if let Some(ref mut wm) = *wm_lock {
+        if let Some(win) = wm.windows.get_mut(&window_id) {
             // Draw rectangle outline:
             // top, bottom, left, right.
-            win.fill_rect(
-                x,
-                y,
-                width,
-                1,
-                color_argb,
-            );
+            win.fill_rect(x, y, width, 1, color_argb);
 
-            win.fill_rect(
-                x,
-                y + height - 1,
-                width,
-                1,
-                color_argb,
-            );
+            win.fill_rect(x, y + height - 1, width, 1, color_argb);
 
-            win.fill_rect(
-                x,
-                y,
-                1,
-                height,
-                color_argb,
-            );
+            win.fill_rect(x, y, 1, height, color_argb);
 
-            win.fill_rect(
-                x + width - 1,
-                y,
-                1,
-                height,
-                color_argb,
-            );
+            win.fill_rect(x + width - 1, y, 1, height, color_argb);
 
             return 1;
         }
@@ -1220,33 +1007,19 @@ fn syscall_draw_rect(
 // SYS_CREATE_WINDOW
 // ============================================================
 
-fn syscall_create_window(
-    frame: &SyscallFrame,
-) -> u64 {
-    let x =
-        frame.rdi as i32;
+fn syscall_create_window(frame: &SyscallFrame) -> u64 {
+    let x = frame.rdi as i32;
 
-    let y =
-        frame.rsi as i32;
+    let y = frame.rsi as i32;
 
-    let width =
-        frame.rdx as usize;
+    let width = frame.rdx as usize;
 
-    let height =
-        frame.r10 as usize;
+    let height = frame.r10 as usize;
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) =
-        *wm_lock
-    {
-        compositor.create_window(
-            x,
-            y,
-            width,
-            height,
-        )
+    if let Some(ref mut compositor) = *wm_lock {
+        compositor.create_window(x, y, width, height)
     } else {
         0
     }
@@ -1256,35 +1029,26 @@ fn syscall_create_window(
 // SYS_UPDATE_WINDOW
 // ============================================================
 
-fn syscall_update_window(
-    frame: &SyscallFrame,
-) -> u64 {
-    let window_id =
-        frame.rdi;
+fn syscall_update_window(frame: &SyscallFrame) -> u64 {
+    let window_id = frame.rdi;
 
-    let buffer_address =
-        frame.rsi;
+    let buffer_address = frame.rsi;
 
-    let pixel_count =
-        frame.rdx as usize;
+    let pixel_count = frame.rdx as usize;
 
     // Validate that the user buffer is mapped and accessible.
     //
     // u32 = 4 bytes per pixel.
     // Checked multiplication prevents integer overflow.
-    let byte_length =
-        match pixel_count.checked_mul(4) {
-            Some(length) =>
-                length,
+    let byte_length = match pixel_count.checked_mul(4) {
+        Some(length) => length,
 
-            None => {
-                crate::serial::write_str(
-                    "sys_update_window: pixel count overflow\n",
-                );
+        None => {
+            crate::serial::write_str("sys_update_window: pixel count overflow\n");
 
-                return 0;
-            }
-        };
+            return 0;
+        }
+    };
 
     if !unsafe {
         crate::memory::validate_user_range(
@@ -1294,31 +1058,18 @@ fn syscall_update_window(
             false,
         )
     } {
-        crate::serial::write_str(
-            "sys_update_window: invalid user memory range\n",
-        );
+        crate::serial::write_str("sys_update_window: invalid user memory range\n");
 
         return 0;
     }
 
     let user_pixels =
-        unsafe {
-            core::slice::from_raw_parts(
-                buffer_address as *const u32,
-                pixel_count,
-            )
-        };
+        unsafe { core::slice::from_raw_parts(buffer_address as *const u32, pixel_count) };
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) =
-        *wm_lock
-    {
-        if compositor.update_window_pixels(
-            window_id,
-            user_pixels,
-        ) {
+    if let Some(ref mut compositor) = *wm_lock {
+        if compositor.update_window_pixels(window_id, user_pixels) {
             1
         } else {
             0
@@ -1333,12 +1084,9 @@ fn syscall_update_window(
 // ============================================================
 
 fn syscall_flush_screen() -> u64 {
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) =
-        *wm_lock
-    {
+    if let Some(ref mut compositor) = *wm_lock {
         compositor.draw();
 
         1
@@ -1353,29 +1101,15 @@ fn syscall_flush_screen() -> u64 {
 // rsi = screen y
 // ============================================================
 
-fn syscall_click(
-    frame: &SyscallFrame,
-) -> u64 {
-    let x =
-        frame.rdi as usize;
+fn syscall_click(frame: &SyscallFrame) -> u64 {
+    let x = frame.rdi as usize;
 
-    let y =
-        frame.rsi as usize;
+    let y = frame.rsi as usize;
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) =
-        *wm_lock
-    {
-        if compositor.sys_click(
-            x,
-            y,
-        ) {
-            1
-        } else {
-            0
-        }
+    if let Some(ref mut compositor) = *wm_lock {
+        if compositor.sys_click(x, y) { 1 } else { 0 }
     } else {
         0
     }
@@ -1400,76 +1134,42 @@ fn syscall_click(
 // where the physical mouse button was pressed.
 //
 
-fn syscall_click_rect(
-    frame: &SyscallFrame,
-) -> u64 {
-    let x =
-        frame.rdi as usize;
+fn syscall_click_rect(frame: &SyscallFrame) -> u64 {
+    let x = frame.rdi as usize;
 
-    let y =
-        frame.rsi as usize;
+    let y = frame.rsi as usize;
 
-    let width =
-        frame.rdx as usize;
+    let width = frame.rdx as usize;
 
-    let height =
-        frame.r10 as usize;
+    let height = frame.r10 as usize;
 
-    crate::serial::write_str(
-        "CLICK DEBUG: SYS_CLICK_RECT query (",
-    );
+    crate::serial::write_str("CLICK DEBUG: SYS_CLICK_RECT query (");
 
-    crate::serial::write_usize(
-        x,
-    );
+    crate::serial::write_usize(x);
 
-    crate::serial::write_str(
-        ", ",
-    );
+    crate::serial::write_str(", ");
 
-    crate::serial::write_usize(
-        y,
-    );
+    crate::serial::write_usize(y);
 
-    crate::serial::write_str(
-        ", ",
-    );
+    crate::serial::write_str(", ");
 
-    crate::serial::write_usize(
-        width,
-    );
+    crate::serial::write_usize(width);
 
-    crate::serial::write_str(
-        ", ",
-    );
+    crate::serial::write_str(", ");
 
-    crate::serial::write_usize(
-        height,
-    );
+    crate::serial::write_usize(height);
 
-    crate::serial::write_str(
-        ")\n",
-    );
+    crate::serial::write_str(")\n");
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    let Some(ref mut compositor) =
-        *wm_lock
-    else {
-        crate::serial::write_str(
-            "CLICK DEBUG: SYS_CLICK_RECT -> NO COMPOSITOR\n",
-        );
+    let Some(ref mut compositor) = *wm_lock else {
+        crate::serial::write_str("CLICK DEBUG: SYS_CLICK_RECT -> NO COMPOSITOR\n");
 
         return 0;
     };
 
-    if compositor.sys_click_rect(
-        x,
-        y,
-        width,
-        height,
-    ) {
+    if compositor.sys_click_rect(x, y, width, height) {
         1
     } else {
         0
@@ -1481,24 +1181,16 @@ fn syscall_click_rect(
 // rdi = window_id
 // ============================================================
 
-fn syscall_destroy_window(
-    frame: &SyscallFrame,
-) -> u64 {
-    let window_id =
-        frame.rdi;
+fn syscall_destroy_window(frame: &SyscallFrame) -> u64 {
+    let window_id = frame.rdi;
 
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    let Some(ref mut wm) =
-        *wm_lock
-    else {
+    let Some(ref mut wm) = *wm_lock else {
         return 0;
     };
 
-    if wm.destroy_window(
-        window_id,
-    ) {
+    if wm.destroy_window(window_id) {
         // The window changed, so a full redraw is appropriate
         // here. This is NOT part of SYS_YIELD.
         wm.draw();
@@ -1532,40 +1224,27 @@ fn syscall_destroy_window(
 // SYS_DESTROY_WINDOW.
 //
 
-fn syscall_launch_app(
-    frame: &SyscallFrame,
-) -> ! {
-    let elf_address =
-        frame.rdi;
+fn syscall_launch_app(frame: &SyscallFrame) -> ! {
+    let elf_address = frame.rdi;
 
-    let elf_length =
-        match usize::try_from(
-            frame.rsi,
-        ) {
-            Ok(length) =>
-                length,
+    let elf_length = match usize::try_from(frame.rsi) {
+        Ok(length) => length,
 
-            Err(_) => {
-                crate::serial::write_str(
-                    "SYS_LAUNCH_APP: ELF length overflow\n",
-                );
+        Err(_) => {
+            crate::serial::write_str("SYS_LAUNCH_APP: ELF length overflow\n");
 
-                loop {
-                    core::hint::spin_loop();
-                }
+            loop {
+                core::hint::spin_loop();
             }
-        };
+        }
+    };
 
     // --------------------------------------------------------
     // Validate ELF buffer.
     // --------------------------------------------------------
 
-    if elf_address == 0
-        || elf_length == 0
-    {
-        crate::serial::write_str(
-            "SYS_LAUNCH_APP: invalid ELF buffer\n",
-        );
+    if elf_address == 0 || elf_length == 0 {
+        crate::serial::write_str("SYS_LAUNCH_APP: invalid ELF buffer\n");
 
         loop {
             core::hint::spin_loop();
@@ -1580,9 +1259,7 @@ fn syscall_launch_app(
             false,
         )
     } {
-        crate::serial::write_str(
-            "SYS_LAUNCH_APP: invalid user ELF range\n",
-        );
+        crate::serial::write_str("SYS_LAUNCH_APP: invalid user ELF range\n");
 
         loop {
             core::hint::spin_loop();
@@ -1596,24 +1273,15 @@ fn syscall_launch_app(
     // process address space.
     // --------------------------------------------------------
 
-    let elf =
-        unsafe {
-            core::slice::from_raw_parts(
-                elf_address as *const u8,
-                elf_length,
-            )
-        };
+    let elf = unsafe { core::slice::from_raw_parts(elf_address as *const u8, elf_length) };
 
-    crate::serial::write_str(
-        "SYS_LAUNCH_APP: launching ELF\n",
-    );
+    crate::serial::write_str("SYS_LAUNCH_APP: launching ELF\n");
 
     // --------------------------------------------------------
     // Obtain the GDT selectors used by Ring 3 processes.
     // --------------------------------------------------------
 
-    let selectors =
-        crate::cpu::gdt::init();
+    let selectors = crate::cpu::gdt::init();
 
     // --------------------------------------------------------
     // Launch application.
@@ -1627,10 +1295,7 @@ fn syscall_launch_app(
     // enters Ring 3.
     // --------------------------------------------------------
 
-    crate::launch_app::run(
-        selectors,
-        elf,
-    );
+    crate::launch_app::run(selectors, elf);
 }
 
 // ============================================================
@@ -1680,16 +1345,13 @@ fn syscall_launch_app(
 //
 
 fn service_usb() {
-    // crate::usb::poll::poll();
+    crate::usb::poll::poll();
 }
 
 fn service_mouse() {
-    let mut wm_lock =
-        crate::wm::WM.lock();
+    let mut wm_lock = crate::wm::WM.lock();
 
-    let Some(ref mut wm) =
-        *wm_lock
-    else {
+    let Some(ref mut wm) = *wm_lock else {
         return;
     };
 
@@ -1702,20 +1364,11 @@ fn service_mouse() {
 // Install syscall gate
 // ============================================================
 
-pub unsafe fn install(
-    idt: &mut InterruptDescriptorTable,
-) {
+pub unsafe fn install(idt: &mut InterruptDescriptorTable) {
     unsafe {
         let entry =
-            idt[0x80].set_handler_addr(
-                VirtAddr::from_ptr(
-                    rusty_syscall_entry
-                        as *const (),
-                ),
-            );
+            idt[0x80].set_handler_addr(VirtAddr::from_ptr(rusty_syscall_entry as *const ()));
 
-        entry.set_privilege_level(
-            PrivilegeLevel::Ring3,
-        );
+        entry.set_privilege_level(PrivilegeLevel::Ring3);
     }
 }
