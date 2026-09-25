@@ -774,9 +774,11 @@ impl XhciRegs {
             write32(address, target as u32);
 
             /*
-             * Match Linux xhci-ring.c: flush the PCIe posted doorbell write
-             * with an MMIO readback before the caller starts waiting for a
-             * transfer event.
+             * PCIe/MMIO writes can be posted.  xHCI command/endpoint
+             * doorbells are the notification that makes the controller
+             * consume the producer ring, so do exactly what Linux does after
+             * ringing a doorbell: read the same register back to force the
+             * posted write through the host bridge.
              */
             let _ = read32(address);
         }
@@ -795,7 +797,11 @@ impl XhciRegs {
         unsafe {
             write32(address, 0);
 
-            /* Flush the PCIe posted command-ring doorbell write. */
+            /*
+             * Flush the posted PCIe MMIO write before relying on the xHC to
+             * fetch the newly queued command TRB.  Linux explicitly performs
+             * this readback in xhci_ring_cmd_db().
+             */
             let _ = read32(address);
         }
     }

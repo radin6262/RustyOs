@@ -70,7 +70,7 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     // Disable or enable on screen debug logging
     // Warning: Running on screen debug logs requires a beefy computer to render all that text
 
-    crate::serial::enable_screen_logging();
+    crate::serial::disable_screen_logging();
 
     // ========================================================
     // Delay / TSC Calibration
