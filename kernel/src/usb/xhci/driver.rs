@@ -194,6 +194,20 @@ const USB3_WARM_RESET_TIMEOUT_US: u64 = 800_000;
 const XHCI_BIOS_HANDOFF_TIMEOUT_US: u64 = 1_000_000;
 const XHCI_POLL_INTERVAL_US: u64 = 10;
 
+/*
+ * Control transfers to EP0 are normally fast, but real hardware may take
+ * longer while the USB link is settling.  Give descriptor/control TDs a
+ * bounded multi-second window before declaring the transfer lost.
+ */
+const XHCI_CONTROL_TRANSFER_TIMEOUT_US: u64 = 5_000_000;
+
+/*
+ * xHCI transfer buffers may not cross a 64 KiB boundary.  The EP0 data used
+ * during enumeration is small, so 64 KiB alignment gives us that invariant
+ * without requiring a multi-TRB data-stage implementation.
+ */
+const XHCI_CONTROL_DMA_ALIGNMENT: usize = 0x1_0000;
+
 /* Conservative real-hardware settling delays. */
 const XHCI_RUN_GRACE_PERIOD_US: u64 = 500_000;
 const USB2_ROOT_RESET_DELAY_US: u64 = 1_000;
@@ -3900,6 +3914,20 @@ impl XhciDriver {
             write_volatile((input_ep0 + index * 4) as *mut u32, value);
         }
 
+        /*
+         * Endpoint State (EP_STATE, bits 0..2) is hardware-owned.  Linux
+         * clears this field before submitting Evaluate Context.  Supplying a
+         * stale state from the Output Device Context can be rejected by real
+         * controllers even though an emulator may tolerate it.
+         */
+        let mut ep_info =
+            read_volatile(input_ep0 as *const u32);
+        ep_info &= !0x7;
+        write_volatile(
+            input_ep0 as *mut u32,
+            ep_info,
+        );
+
         let mut ep_info2 = read_volatile((input_ep0 + 4) as *const u32);
         ep_info2 &= !(0xFFFFu32 << 16);
         ep_info2 |= (max_packet_size as u32) << 16;
@@ -4008,22 +4036,66 @@ impl XhciDriver {
         let mut data_virt = 0usize;
         let data_len = data_in.as_ref().map_or(0, |buffer| buffer.len());
 
+        /* USB wLength is a 16-bit field. Never silently truncate a larger
+         * slice in the Setup TRB while submitting a larger Data TRB. */
+        if data_len > u16::MAX as usize {
+            crate::serial::write_str(
+                "xHCI: control transfer rejected: data length exceeds USB wLength\n",
+            );
+            return None;
+        }
+
+        /*
+         * This API's data-bearing form is specifically an IN control
+         * transfer. OUT control requests in Rusty currently use the no-data
+         * helper below (SET_CONFIGURATION, SET_PROTOCOL, etc.).
+         */
+        let direction_in = (request_type & 0x80) != 0;
+
+        if data_len != 0 && !direction_in {
+            crate::serial::write_str(
+                "xHCI: control_transfer_in called with an OUT data stage\n",
+            );
+            return None;
+        }
+
         if data_len != 0 {
-            data_phys = memory::allocate_dma_region(data_len, 64, None)?;
-            data_virt = memory::physical_to_virtual(data_phys) as usize;
+            /*
+             * Keep the DMA buffer inside a single 64 KiB boundary.  This is
+             * important for xHCI data-stage handling on physical hardware and
+             * avoids relying on an emulator that may accept boundary-crossing
+             * transfers.
+             */
+            data_phys =
+                memory::allocate_dma_region(
+                    data_len,
+                    XHCI_CONTROL_DMA_ALIGNMENT,
+                    None,
+                )?;
+
+            data_virt =
+                memory::physical_to_virtual(
+                    data_phys,
+                ) as usize;
+
             if data_virt == 0 {
                 return None;
             }
 
-            if let Some(buffer) = data_in.as_ref() {
-                /* Zero first so a short transfer cannot expose old data. */
-                write_bytes(data_virt as *mut u8, 0, data_len);
-                dma_sync_for_device(data_virt as *const u8, data_len);
-                let _ = buffer;
-            }
+            write_bytes(
+                data_virt as *mut u8,
+                0,
+                data_len,
+            );
+
+            dma_sync_for_device(
+                data_virt as *const u8,
+                data_len,
+            );
         }
 
-        let ring = self.ep0_rings[slot].as_mut()?;
+        let ring =
+            self.ep0_rings[slot].as_mut()?;
 
         let setup_value =
             request_type as u64
@@ -4032,40 +4104,153 @@ impl XhciDriver {
             | ((index as u64) << 32)
             | ((data_len as u64 & 0xFFFF) << 48);
 
-        let mut setup = Trb::new(
-            setup_value,
-            8,
-            (TrbType::SetupStage as u32) << 10,
+        /*
+         * Setup Stage TRT:
+         *
+         *   0 = No Data Stage
+         *   2 = Data Stage OUT
+         *   3 = Data Stage IN
+         *
+         * Linux selects TRT from bmRequestType.DIR.  The previous Rusty code
+         * hard-coded 2 for every data-bearing request, which made
+         * GET_DESCRIPTOR advertise OUT while the Data TRB advertised IN.
+         */
+        let setup_transfer_type =
+            if data_len == 0 {
+                0
+            } else if direction_in {
+                3
+            } else {
+                2
+            };
+
+        crate::serial::write_str(
+            "xHCI: control TD slot=",
         );
+        crate::serial::write_hex(
+            slot_id as u64,
+        );
+        crate::serial::write_str(
+            " ep=1 reqtype=",
+        );
+        crate::serial::write_hex(
+            request_type as u64,
+        );
+        crate::serial::write_str(
+            " req=",
+        );
+        crate::serial::write_hex(
+            request as u64,
+        );
+        crate::serial::write_str(
+            " value=",
+        );
+        crate::serial::write_hex(
+            value as u64,
+        );
+        crate::serial::write_str(
+            " index=",
+        );
+        crate::serial::write_hex(
+            index as u64,
+        );
+        crate::serial::write_str(
+            " len=",
+        );
+        crate::serial::write_hex(
+            data_len as u64,
+        );
+        crate::serial::write_str(
+            " TRT=",
+        );
+        crate::serial::write_hex(
+            setup_transfer_type as u64,
+        );
+        crate::serial::write_str(
+            " DIR=",
+        );
+        crate::serial::write_str(
+            if direction_in {
+                "IN"
+            } else {
+                "OUT"
+            },
+        );
+        crate::serial::write_str(
+            "\n",
+        );
+
+        let mut setup =
+            Trb::new(
+                setup_value,
+                8,
+                (TrbType::SetupStage as u32) << 10,
+            );
+
+        /*
+         * The Setup TRB is followed by the Status TRB even for a no-data
+         * control request, so it is always chained. The final Status TRB is
+         * the end of the TD and therefore is not chained.
+         */
         setup.set_immediate_data(true);
         setup.set_chain(true);
-        setup.set_transfer_type(if data_len == 0 {
-            0
-        } else {
-            2
-        });
+        setup.set_transfer_type(
+            setup_transfer_type,
+        );
 
-        let _setup_phys = ring.push(setup);
+        let _setup_phys =
+            ring.push(setup);
 
         if data_len != 0 {
-            let mut data_trb = Trb::new(
-                data_phys,
-                data_len as u32,
-                (TrbType::DataStage as u32) << 10,
+            let mut data_trb =
+                Trb::new(
+                    data_phys,
+                    data_len as u32,
+                    (TrbType::DataStage as u32) << 10,
+                );
+
+            data_trb.set_direction_in(
+                direction_in,
             );
-            data_trb.set_direction_in(true);
+
+            /*
+             * Match Linux's control-transfer Data TRB construction: IN data
+             * stages use Interrupt-on-Short-Packet so a short descriptor is a
+             * normal completion rather than a lost transfer.
+             */
+            data_trb.set_interrupt_on_short_packet(
+                direction_in,
+            );
+
             data_trb.set_chain(true);
             ring.push(data_trb);
         }
 
-        let mut status_trb = Trb::new(
-            0,
-            0,
-            (TrbType::StatusStage as u32) << 10,
+        let mut status_trb =
+            Trb::new(
+                0,
+                0,
+                (TrbType::StatusStage as u32) << 10,
+            );
+
+        /*
+         * Status direction is opposite the data direction.  For a no-data
+         * control transfer the status stage is IN.
+         */
+        status_trb.set_direction_in(
+            if data_len == 0 {
+                true
+            } else {
+                !direction_in
+            },
         );
-        status_trb.set_direction_in(data_len == 0);
-        status_trb.set_interrupt_on_completion(true);
-        let status_phys = ring.push(status_trb);
+
+        status_trb.set_interrupt_on_completion(
+            true,
+        );
+
+        let status_phys =
+            ring.push(status_trb);
 
         dma_sync_for_device(
             ring.buffer.as_ptr() as *const u8,
@@ -4075,7 +4260,10 @@ impl XhciDriver {
 
         self.regs.ring_doorbell(slot_id, 1);
 
-        let deadline = crate::delay::now_us().saturating_add(1_000_000);
+        let deadline =
+            crate::delay::now_us().saturating_add(
+                XHCI_CONTROL_TRANSFER_TIMEOUT_US,
+            );
 
         loop {
             self.poll_events();
@@ -4105,14 +4293,223 @@ impl XhciDriver {
             }
 
             if crate::delay::now_us() >= deadline {
-                crate::serial::write_str("xHCI: control transfer timeout slot=");
-                crate::serial::write_hex(slot_id as u64);
-                crate::serial::write_str("\n");
+                crate::serial::write_str(
+                    "xHCI: control transfer timeout slot=",
+                );
+                crate::serial::write_hex(
+                    slot_id as u64,
+                );
+                crate::serial::write_str(
+                    " ep=1 status_trb=0x",
+                );
+                crate::serial::write_hex(
+                    status_phys,
+                );
+                crate::serial::write_str(
+                    " USBSTS=0x",
+                );
+                crate::serial::write_hex(
+                    self.regs.usbsts() as u64,
+                );
+                crate::serial::write_str(
+                    " CRCR=0x",
+                );
+                crate::serial::write_hex(
+                    self.regs.crcr(),
+                );
+                crate::serial::write_str(
+                    "\n",
+                );
+                let recovered =
+                    self.recover_ep0_after_timeout(
+                        slot_id,
+                    );
+
+                crate::serial::write_str(
+                    "xHCI: EP0 timeout recovery=",
+                );
+                crate::serial::write_str(
+                    if recovered {
+                        "success"
+                    } else {
+                        "failed"
+                    },
+                );
+                crate::serial::write_str(
+                    "\n",
+                );
+
                 return None;
             }
 
             crate::delay::delay_us(XHCI_POLL_INTERVAL_US);
         }
+    }
+
+    /*
+     * ======================================================================
+     * Recover EP0 after a control-transfer timeout
+     * ======================================================================
+     *
+     * A timed-out transfer cannot simply be forgotten.  Linux stops the
+     * endpoint and then uses Set TR Dequeue Pointer to put the transfer ring
+     * back at a known dequeue position before allowing another TD to run.
+     * Without that recovery a stale EP0 TD can poison every later descriptor
+     * request on real hardware.
+     *
+     * Rusty uses a single EP0 ring segment, so recovery can safely discard the
+     * timed-out TD and restart the ring at TRB 0 with cycle state 1.
+     * ======================================================================
+     */
+
+    unsafe fn recover_ep0_after_timeout(&mut self, slot_id: u8) -> bool {
+        let slot = slot_id as usize;
+        if slot == 0 || slot >= self.ep0_rings.len() {
+            return false;
+        }
+
+        let ring_phys = match self.ep0_rings[slot].as_ref() {
+            Some(ring) => ring.phys_addr,
+            None => return false,
+        };
+
+        crate::serial::write_str(
+            "xHCI: recovering timed-out EP0 slot=",
+        );
+        crate::serial::write_hex(
+            slot_id as u64,
+        );
+        crate::serial::write_str(
+            "\n",
+        );
+
+        /*
+         * First stop EP0 so the controller can no longer consume the stale
+         * control TD while software resets the ring.
+         */
+        let mut stop =
+            Trb::new(
+                0,
+                0,
+                (TrbType::StopEndpointCommand as u32) << 10,
+            );
+        stop.set_slot_id(slot_id);
+        stop.set_endpoint_id(1);
+
+        let Some(stop_completion) =
+            self.submit_command_wait(
+                stop,
+                None,
+                XHCI_CONTROL_TRANSFER_TIMEOUT_US,
+            )
+        else {
+            crate::serial::write_str(
+                "xHCI: EP0 Stop Endpoint timed out\n",
+            );
+            return false;
+        };
+
+        if stop_completion.completion_code != 1 {
+            crate::serial::write_str(
+                "xHCI: EP0 Stop Endpoint failed code=",
+            );
+            crate::serial::write_hex(
+                stop_completion.completion_code as u64,
+            );
+            crate::serial::write_str(
+                "\n",
+            );
+            return false;
+        }
+
+        /*
+         * Discard the stale TDs from the software ring and rebuild its Link
+         * TRB.  The hardware dequeue pointer is moved separately below.
+         */
+        {
+            let Some(ring) =
+                self.ep0_rings[slot].as_mut()
+            else {
+                return false;
+            };
+
+            ring.reset();
+
+            dma_sync_for_device(
+                ring.buffer.as_ptr() as *const u8,
+                ring.size * XHCI_TRB_SIZE,
+            );
+        }
+
+        fence(Ordering::SeqCst);
+
+        /*
+         * Set the hardware dequeue pointer to the first TRB and restore the
+         * producer cycle state used by Ring::reset(). DCS is bit 0 of the
+         * command parameter.
+         */
+        let mut set_deq =
+            Trb::new(
+                ring_phys | 1,
+                0,
+                (TrbType::SetTrDequeuePointerCommand as u32) << 10,
+            );
+        set_deq.set_slot_id(slot_id);
+        set_deq.set_endpoint_id(1);
+
+        let Some(deq_completion) =
+            self.submit_command_wait(
+                set_deq,
+                None,
+                XHCI_CONTROL_TRANSFER_TIMEOUT_US,
+            )
+        else {
+            crate::serial::write_str(
+                "xHCI: EP0 Set TR Dequeue Pointer timed out\n",
+            );
+            return false;
+        };
+
+        if deq_completion.completion_code != 1 {
+            crate::serial::write_str(
+                "xHCI: EP0 Set TR Dequeue Pointer failed code=",
+            );
+            crate::serial::write_hex(
+                deq_completion.completion_code as u64,
+            );
+            crate::serial::write_str(
+                "\n",
+            );
+            return false;
+        }
+
+        /*
+         * A transfer completion from the timed-out TD is no longer useful to
+         * the HID layer. Do not let stale completions accumulate.
+         */
+        self.transfer_completions
+            .retain(|completion| {
+                !(completion.slot_id == slot_id
+                    && completion.endpoint_id == 1)
+            });
+
+        crate::serial::write_str(
+            "xHCI: EP0 recovery complete slot=",
+        );
+        crate::serial::write_hex(
+            slot_id as u64,
+        );
+        crate::serial::write_str(
+            " ring=0x",
+        );
+        crate::serial::write_hex(
+            ring_phys,
+        );
+        crate::serial::write_str(
+            "\n",
+        );
+
+        true
     }
 
     /*

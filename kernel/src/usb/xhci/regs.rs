@@ -772,6 +772,13 @@ impl XhciRegs {
 
         unsafe {
             write32(address, target as u32);
+
+            /*
+             * Match Linux xhci-ring.c: flush the PCIe posted doorbell write
+             * with an MMIO readback before the caller starts waiting for a
+             * transfer event.
+             */
+            let _ = read32(address);
         }
     }
 
@@ -783,8 +790,13 @@ impl XhciRegs {
 
     #[inline(always)]
     pub fn ring_command(&self) {
+        let address = self.doorbell_base();
+
         unsafe {
-            write32(self.doorbell_base(), 0);
+            write32(address, 0);
+
+            /* Flush the PCIe posted command-ring doorbell write. */
+            let _ = read32(address);
         }
     }
 

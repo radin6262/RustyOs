@@ -137,7 +137,7 @@ impl HidManager {
         let initial_mps = match speed {
             1 | 2 => 8u16,
             3 => 64u16,
-            4 => 512u16,
+            4 | 5 => 512u16, // SuperSpeed / SuperSpeedPlus
             _ => {
                 crate::serial::write_str(
                     "USB HID: unsupported/unknown device speed\n",
