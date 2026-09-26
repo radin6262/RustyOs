@@ -3,6 +3,7 @@
 RustyOS is a lightweight hobby operating system written in Rust.
 
 > This project has been temporarily discotninued until i get some free time or next summer
+<br>
 > Help Wanted: if you know how to fix it(or my issue) please contact me at radindavari054laptop@gmail.com or open a GitHub issue
 
 ## Features
