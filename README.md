@@ -2,7 +2,7 @@
 
 RustyOS is a lightweight hobby operating system written in Rust.
 
-> Warning: This os has been discontinued due to the xhci driver not working. Help Wanted: if you know how to fix it(or my issue) please contact me at radindavari054laptop@gmail.com
+> Warning: This os has been discontinued due to the xhci driver not working. Help Wanted: if you know how to fix it(or my issue) please contact me at radindavari054laptop@gmail.com or open a GitHub issue
 
 ## Features
 
