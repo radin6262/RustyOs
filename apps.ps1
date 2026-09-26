@@ -1,3 +1,6 @@
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = $PSScriptRoot

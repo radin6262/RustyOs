@@ -2,7 +2,7 @@
 
 RustyOS is a lightweight hobby operating system written in Rust.
 
-> Warning: xhci driver is not working as of now
+> Warning: Xhci driver only works on asus tuf f15 laptop due to xhci filtering(but soon we will initlize each controller and bring full device support to each pc and laptop)
 
 ## Features
 

@@ -1,3 +1,6 @@
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+
 cargo clean
 
 
