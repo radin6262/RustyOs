@@ -2,7 +2,7 @@
 
 RustyOS is a lightweight hobby operating system written in Rust.
 
-> Warning: Xhci driver only works QEMU as of now
+> Warning: This os has been discontinued due to the xhci driver not working. Help Wanted: if you know how to fix it(or my issue) please contact me at radindavari054laptop@gmail.com
 
 ## Features
 
