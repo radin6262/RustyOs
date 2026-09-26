@@ -13,11 +13,17 @@ use super::xhci::XhciDriver;
 // USB state
 // ============================================================
 //
-// Rusty's USB subsystem currently contains only our custom
-// xHCI driver.
+// Rusty's USB subsystem currently contains the custom xHCI driver
+// plus the boot-protocol HID layer.
 //
-// CrabUSB is not used here.
+// The xHCI driver owns:
+//   - controller reset/start state
+//   - command/event rings
+//   - root-port reset state machines
+//   - device/input contexts
+//   - synchronous control transfers
 //
+// The HID layer owns only USB HID enumeration and input decoding.
 // ============================================================
 
 pub(crate) struct UsbState {
@@ -44,7 +50,6 @@ impl UsbStorage {
 }
 
 static USB_STORAGE: UsbStorage = UsbStorage::new();
-
 static USB_INITIALIZED: AtomicU8 = AtomicU8::new(0);
 
 // ============================================================
@@ -68,127 +73,257 @@ pub fn is_initialized() -> bool {
 }
 
 // ============================================================
-// Wait for one USB2 root-port reset
-// ============================================================
-//
-// reset_port() is deliberately non-blocking.  The controller owns the actual
-// reset duration; this function simply drives the driver's state machine from
-// the normal USB initialization path until the port becomes ready.
-//
-// It is NEVER called from the xHCI event-consumer path.
-//
+// Root-port constants used only by the initialization layer
 // ============================================================
 
-fn wait_for_usb2_port_ready(xhci: &mut XhciDriver, port: usize) -> bool {
-    const RESET_TIMEOUT_US: u64 = 500_000;
-    const POLL_INTERVAL_US: u64 = 1_000;
+const PORTSC_PLS_MASK: u32 = 0xF << 5;
+const PORTSC_PR: u32 = 1 << 4;
+const PORTSC_CAS: u32 = 1 << 24;
+
+const PLS_U0: u8 = 0;
+const PLS_INACTIVE: u8 = 6;
+const PLS_COMPLIANCE: u8 = 10;
+
+// The xHCI driver owns the actual reset deadline. These are supervisory
+// deadlines for this higher-level enumeration path, not PORTSC reset timers.
+const USB2_PORT_READY_TIMEOUT_US: u64 = 1_000_000;
+const USB3_PORT_READY_TIMEOUT_US: u64 = 2_000_000;
+const PORT_POLL_INTERVAL_US: u64 = 1_000;
+
+// ============================================================
+// Wait for a USB2 root port to become enumeration-ready
+// ============================================================
+//
+// XhciDriver::run() already starts the driver's non-blocking reset state
+// machine for newly connected USB2 ports. This helper never writes PORTSC
+// directly and never acknowledges PRC itself; it only drives XhciDriver's
+// state machine through poll_events().
+// ============================================================
+
+unsafe fn wait_for_usb2_port_ready(xhci: &mut XhciDriver, port: usize) -> bool {
+    if !xhci.is_usb2_port(port) {
+        return false;
+    }
 
     let start_us = crate::delay::now_us();
-    let deadline_us = start_us.saturating_add(RESET_TIMEOUT_US);
+    let deadline_us = start_us.saturating_add(USB2_PORT_READY_TIMEOUT_US);
+
+    // If run() did not already start a reset, request one here only when the
+    // port is connected + disabled + not actively resetting.
+    let initial = xhci.port_status(port);
+    let initial_connected = (initial & (1 << 0)) != 0;
+    let initial_enabled = (initial & (1 << 1)) != 0;
+    let initial_resetting = (initial & PORTSC_PR) != 0;
+
+    if !initial_connected {
+        return false;
+    }
+
+    if !xhci.port_reset_pending(port) && !initial_enabled && !initial_resetting {
+        let _ = xhci.request_usb2_port_reset(port);
+    }
 
     loop {
-        unsafe {
-            xhci.poll_events();
-        }
+        xhci.poll_events();
 
-        let portsc = xhci.regs.portsc(port);
+        let portsc = xhci.port_status(port);
         let connected = (portsc & (1 << 0)) != 0;
         let enabled = (portsc & (1 << 1)) != 0;
-        let reset_active = (portsc & (1 << 4)) != 0;
-        let reset_change = (portsc & (1 << 21)) != 0;
-        let pls = ((portsc >> 5) & 0xF) as u8;
+        let resetting = (portsc & PORTSC_PR) != 0;
+        let pls = ((portsc & PORTSC_PLS_MASK) >> 5) as u8;
 
         if !connected {
-            serial::write_str("USB: device disconnected while waiting for port reset\n");
+            serial::write_str(
+                "USB: USB2 device disconnected while waiting for port readiness\n",
+            );
             return false;
         }
 
-        /*
-         * The driver clears its pending state only after PR has cleared and
-         * the port has reached the expected enabled/U0 state.
-         */
-        if !xhci.port_reset_pending(port) {
-            serial::write_str("USB: USB2 port reset state machine completed on port ");
+        if !xhci.port_reset_pending(port)
+            && enabled
+            && !resetting
+            && pls == PLS_U0
+        {
+            serial::write_str("USB: USB2 root port ready on port ");
             serial::write_usize(port);
+            serial::write_str(" speed=0x");
+            serial::write_hex(xhci.port_speed(port) as u64);
+            serial::write_str(" PORTSC=0x");
+            serial::write_hex(portsc as u64);
             serial::write_str("\n");
-
-            serial::write_str("USB: port reset result CCS=");
-            serial::write_usize(connected as usize);
-            serial::write_str(" PED=");
-            serial::write_usize(enabled as usize);
-            serial::write_str(" PR=");
-            serial::write_usize(reset_active as usize);
-            serial::write_str(" PRC=");
-            serial::write_usize(reset_change as usize);
-            serial::write_str(" PLS=0x");
-            serial::write_hex(pls as u64);
-            serial::write_str("\n");
-
-            return enabled && !reset_active && pls == 0;
+            return true;
         }
 
         if crate::delay::now_us() >= deadline_us {
-            serial::write_str("USB: timed out waiting for USB2 port reset on port ");
+            serial::write_str(
+                "USB: timed out waiting for USB2 root port readiness port ",
+            );
+            serial::write_usize(port);
+            serial::write_str(" PORTSC=0x");
+            serial::write_hex(portsc as u64);
+            serial::write_str(" pending=");
+            serial::write_usize(xhci.port_reset_pending(port) as usize);
+            serial::write_str("\n");
+            return false;
+        }
+
+        crate::delay::delay_us(PORT_POLL_INTERVAL_US);
+    }
+}
+
+// ============================================================
+// Wait for a USB3 root port to become enumeration-ready
+// ============================================================
+//
+// A healthy USB3 port should reach U0 without a USB2 PORT_RESET. Warm reset is
+// requested only for the xHCI/USB3 recovery states exposed by the driver.
+// ============================================================
+
+unsafe fn wait_for_usb3_port_ready(xhci: &mut XhciDriver, port: usize) -> bool {
+    if !xhci.is_usb3_port(port) {
+        return false;
+    }
+
+    let start_us = crate::delay::now_us();
+    let deadline_us = start_us.saturating_add(USB3_PORT_READY_TIMEOUT_US);
+
+    loop {
+        xhci.poll_events();
+
+        let portsc = xhci.port_status(port);
+        let connected = (portsc & (1 << 0)) != 0;
+        let enabled = (portsc & (1 << 1)) != 0;
+        let pls = ((portsc & PORTSC_PLS_MASK) >> 5) as u8;
+        let cas = (portsc & PORTSC_CAS) != 0;
+        let warm_pending = xhci.usb3_warm_reset_pending(port);
+
+        if !connected && !warm_pending {
+            return false;
+        }
+
+        if connected && enabled && pls == PLS_U0 && !warm_pending {
+            serial::write_str("USB: USB3 root port ready on port ");
+            serial::write_usize(port);
+            serial::write_str(" speed=0x");
+            serial::write_hex(xhci.port_speed(port) as u64);
+            serial::write_str(" PORTSC=0x");
+            serial::write_hex(portsc as u64);
+            serial::write_str("\n");
+            return true;
+        }
+
+        // Let the driver own USB3 warm-reset semantics. Never issue the USB2
+        // PORTSC.PR operation on a USB3 protocol port.
+        let recovery_state = cas || pls == PLS_INACTIVE || pls == PLS_COMPLIANCE;
+
+        if recovery_state && !warm_pending {
+            serial::write_str("USB: requesting USB3 warm-reset recovery on port ");
             serial::write_usize(port);
             serial::write_str(" PORTSC=0x");
             serial::write_hex(portsc as u64);
             serial::write_str("\n");
+
+            if !xhci.warm_reset_usb3_port(port) {
+                serial::write_str(
+                    "USB: USB3 warm-reset request rejected by xHCI driver\n",
+                );
+                return false;
+            }
+
+            continue;
+        }
+
+        if crate::delay::now_us() >= deadline_us {
+            serial::write_str(
+                "USB: timed out waiting for USB3 root port readiness port ",
+            );
+            serial::write_usize(port);
+            serial::write_str(" PORTSC=0x");
+            serial::write_hex(portsc as u64);
+            serial::write_str(" warm_pending=");
+            serial::write_usize(warm_pending as usize);
+            serial::write_str("\n");
             return false;
         }
 
-        crate::delay::delay_us(POLL_INTERVAL_US);
+        crate::delay::delay_us(PORT_POLL_INTERVAL_US);
     }
+}
+
+// ============================================================
+// Find one enumeration-ready root port
+// ============================================================
+//
+// Prefer USB2 because the current HID/xHCI endpoint implementation is tested
+// primarily against the USB2 boot-HID path. USB3 is still supported when no
+// ready USB2 device is present and the controller reports a healthy U0 port.
+// ============================================================
+
+unsafe fn find_enumeration_port(xhci: &mut XhciDriver) -> Option<usize> {
+    for index in 0..xhci.usb2_ports_count() {
+        let port = xhci.usb2_ports[index] as usize;
+        if !xhci.port_connected(port) {
+            continue;
+        }
+
+        if wait_for_usb2_port_ready(xhci, port) {
+            return Some(port);
+        }
+    }
+
+    for index in 0..xhci.usb3_ports_count() {
+        let port = xhci.usb3_ports[index] as usize;
+        if !xhci.port_connected(port) {
+            continue;
+        }
+
+        if wait_for_usb3_port_ready(xhci, port) {
+            return Some(port);
+        }
+    }
+
+    None
 }
 
 // ============================================================
 // Initialize USB
 // ============================================================
 //
-// Initialization sequence:
+// Lifecycle is intentionally delegated to XhciDriver:
 //
 //     PCI
 //       |
 //       v
-//     Find xHCI
-//       |
-//       v
-//     Validate BAR0 + enable/mapped PCI MMIO
+//     MMIO mapping
 //       |
 //       v
 //     XhciDriver::new()
 //       |
-//       v
-//     XhciDriver::halt()
+//       +--> BIOS/OS legacy handoff
 //       |
 //       v
-//     XhciDriver::reset()
+//     halt()
 //       |
 //       v
-//     XhciDriver::init()
+//     reset()
 //       |
 //       v
-//     XhciDriver::run()
+//     init()
 //       |
 //       v
-//     Controller: RS=1 and HCH=0
+//     run()
 //       |
 //       v
-//     Dump PORTSC / capabilities
+//     wait for a ready root port
 //       |
 //       v
-//     Observe connected USB2 root port
+//     Enable Slot
 //       |
 //       v
-//     Drive non-blocking port reset state machine
-//       |
-//       v
-//     Clear PRC after interpreting completion
-//       |
-//       v
-//     Enable Slot command
+//     HID Address Device / control transfers / endpoints
 //
-// Device-context/address/configuration is NOT implemented yet.
-//
+// The init layer does not manipulate CRCR, DCBAAP, ERST, ERDP, IMAN, doorbells,
+// command TRBs, or event TRBs directly.
 // ============================================================
 
 pub fn init() {
@@ -201,10 +336,6 @@ pub fn init() {
         return;
     }
 
-    /*
-     * The custom xHCI driver uses the kernel's calibrated TSC clock for
-     * controller and root-port deadlines.  Its initializer is idempotent.
-     */
     crate::delay::init();
 
     serial::write_str("USB: custom xHCI subsystem initialization started\n");
@@ -217,7 +348,6 @@ pub fn init() {
 
     let controller = match xhci_pci::find_xhci() {
         Some(controller) => controller,
-
         None => {
             serial::write_str("USB: no xHCI controller found\n");
             return;
@@ -227,7 +357,7 @@ pub fn init() {
     serial::write_str("USB: xHCI controller found\n");
 
     // ========================================================
-    // BAR0
+    // Validate BAR0
     // ========================================================
 
     serial::write_str("USB: BAR0=");
@@ -238,10 +368,6 @@ pub fn init() {
 
     let bar0 = controller.bar0 as usize;
     let bar0_size = controller.bar0_size as usize;
-
-    // ========================================================
-    // Validate BAR0
-    // ========================================================
 
     if bar0 == 0 {
         panic!("Rusty: xHCI BAR0 is zero");
@@ -255,9 +381,6 @@ pub fn init() {
         panic!("Rusty: xHCI BAR0 is not 16-byte aligned");
     }
 
-    /*
-     * Sanity-check the BAR range before passing it to the MMIO mapper.
-     */
     if bar0.checked_add(bar0_size).is_none() {
         panic!("Rusty: xHCI BAR0 range overflows usize");
     }
@@ -275,7 +398,7 @@ pub fn init() {
     serial::write_str("USB: xHCI MMIO mapped\n");
 
     // ========================================================
-    // Create custom xHCI driver
+    // Create xHCI driver
     // ========================================================
 
     serial::write_str("USB: creating custom xHCI driver...\n");
@@ -285,12 +408,7 @@ pub fn init() {
     serial::write_str("USB: custom xHCI driver created\n");
 
     // ========================================================
-    // HALT CONTROLLER
-    // ========================================================
-    //
-    // new() allocates/derives the driver's persistent state.  It does NOT
-    // replace the explicit Linux-style halt/reset/init/run phases.
-    //
+    // Halt controller
     // ========================================================
 
     serial::write_str("USB: halting custom xHCI controller...\n");
@@ -302,12 +420,7 @@ pub fn init() {
     serial::write_str("USB: custom xHCI controller halted\n");
 
     // ========================================================
-    // RESET CONTROLLER
-    // ========================================================
-    //
-    // This asserts HCRST, waits for it to self-clear, and then waits for CNR
-    // to clear before any operational/runtime programming continues.
-    //
+    // Reset controller
     // ========================================================
 
     serial::write_str("USB: resetting custom xHCI controller...\n");
@@ -319,20 +432,7 @@ pub fn init() {
     serial::write_str("USB: custom xHCI controller reset complete\n");
 
     // ========================================================
-    // INITIALIZE CONTROLLER
-    // ========================================================
-    //
-    // This is the actual xhci_init() phase:
-    //
-    //     MAXSLOTSEN
-    //     CRCR
-    //     DCBAAP
-    //     DBOFF software pointer
-    //     DNCTRL
-    //     Event Ring / ERST / ERDP
-    //
-    // The controller is still halted during this phase.
-    //
+    // Initialize controller structures
     // ========================================================
 
     serial::write_str("USB: initializing custom xHCI controller...\n");
@@ -344,19 +444,7 @@ pub fn init() {
     serial::write_str("USB: custom xHCI controller initialization complete\n");
 
     // ========================================================
-    // START CONTROLLER
-    // ========================================================
-    //
-    // run() performs the run-finished phase:
-    //
-    //     CMD_EIE = 1
-    //     IMAN.IE = 1
-    //     IMAN.IP = 1 (RW1C acknowledge)
-    //     USBCMD.RS = 1
-    //     wait for USBSTS.HCH = 0
-    //
-    // This is the point at which the controller actually becomes operational.
-    //
+    // Start controller
     // ========================================================
 
     serial::write_str("USB: starting custom xHCI controller...\n");
@@ -368,7 +456,7 @@ pub fn init() {
     serial::write_str("USB: custom xHCI controller started\n");
 
     // ========================================================
-    // Verify RUN/HCH state explicitly
+    // Verify controller state
     // ========================================================
 
     let command = xhci.regs.usbcmd();
@@ -380,11 +468,11 @@ pub fn init() {
     serial::write_hex(status as u64);
     serial::write_str("\n");
 
-    if (command & (1 << 0)) == 0 {
+    if (command & 1) == 0 {
         panic!("Rusty: xHCI RUN bit is not set after start");
     }
 
-    if (status & (1 << 0)) != 0 {
+    if (status & 1) != 0 {
         panic!("Rusty: xHCI HCH bit is still set after start");
     }
 
@@ -393,168 +481,23 @@ pub fn init() {
     }
 
     // ========================================================
-    // Dump controller state
+    // Diagnostic state dump
     // ========================================================
 
     serial::write_str("USB: dumping xHCI controller state...\n");
-
     xhci.debug_state();
-
     serial::write_str("USB: xHCI controller state dump complete\n");
 
-    // ========================================================
-    // Dump root ports
-    // ========================================================
-
     serial::write_str("USB: dumping xHCI PORTSC registers...\n");
-
     xhci.dump_ports();
-
     serial::write_str("USB: xHCI PORTSC dump complete\n");
 
     // ========================================================
-    // Extended capabilities
-    // ========================================================
-
-    serial::write_str("USB: checking xHCI extended capabilities...\n");
-
-    xhci.regs
-        .walk_extended_capabilities(|offset, capability_id, next, header| {
-            serial::write_str("xHCI: EXT CAP offset=");
-            serial::write_hex(offset as u64);
-
-            serial::write_str(" id=");
-            serial::write_hex(capability_id as u64);
-
-            serial::write_str(" next=");
-            serial::write_hex(next as u64);
-
-            serial::write_str(" header=");
-            serial::write_hex(header as u64);
-
-            serial::write_str("\n");
-
-            // ------------------------------------------------
-            // USB Legacy Support
-            // ------------------------------------------------
-
-            if capability_id == 1 {
-                let cap = xhci.regs.extended_capability(offset);
-
-                let bios_owned = (cap & (1 << 16)) != 0;
-                let os_owned = (cap & (1 << 24)) != 0;
-
-                serial::write_str("xHCI: USB Legacy Support found\n");
-
-                serial::write_str("xHCI: LEGACY CAP=0x");
-                serial::write_hex(cap as u64);
-                serial::write_str("\n");
-
-                serial::write_str("xHCI: BIOS Owned=");
-                serial::write_usize(bios_owned as usize);
-
-                serial::write_str(" OS Owned=");
-                serial::write_usize(os_owned as usize);
-
-                serial::write_str("\n");
-            }
-
-            // ------------------------------------------------
-            // Supported Protocol
-            // ------------------------------------------------
-
-            if capability_id == 2 {
-                let revision = xhci.regs.extended_capability(offset);
-                let name_string = xhci.regs.extended_capability(offset + 0x04);
-                let port_info = xhci.regs.extended_capability(offset + 0x08);
-
-                let major = ((revision >> 24) & 0xFF) as u8;
-                let minor = ((revision >> 16) & 0xFF) as u8;
-                let port_offset = (port_info & 0xFF) as u8;
-                let port_count = ((port_info >> 8) & 0xFF) as u8;
-
-                serial::write_str("xHCI: Supported Protocol\n");
-
-                serial::write_str("xHCI:   revision=0x");
-                serial::write_hex(((major as u64) << 8) | minor as u64);
-                serial::write_str("\n");
-
-                serial::write_str("xHCI:   name=0x");
-                serial::write_hex(name_string as u64);
-                serial::write_str("\n");
-
-                serial::write_str("xHCI:   port offset=0x");
-                serial::write_hex(port_offset as u64);
-                serial::write_str("\n");
-
-                serial::write_str("xHCI:   port count=0x");
-                serial::write_hex(port_count as u64);
-                serial::write_str("\n");
-            }
-        });
-
-    serial::write_str("USB: xHCI extended capability scan complete\n");
-
-    // ========================================================
-    // Give the controller one event-processing opportunity
-    // ========================================================
-    //
-    // run() already seeds the root-port service state.  Poll once here so
-    // any immediately-generated PORTSC or command-completion events are
-    // consumed before the explicit test below.
-    //
+    // Give the event consumer one opportunity before port scan.
     // ========================================================
 
     unsafe {
         xhci.poll_events();
-    }
-
-    // ========================================================
-    // Find connected USB2 root port for the reset test
-    // ========================================================
-    //
-    // Do NOT choose an arbitrary physical PORTSC number.  USB2 and USB3 root
-    // hubs are derived from Supported Protocol capabilities, and a USB3
-    // physical companion must never receive the ordinary USB2 PORT_RESET path.
-    //
-    // ========================================================
-
-    serial::write_str("USB: searching for a connected USB2 root port...\n");
-
-    let mut test_port = None;
-
-    for index in 0..xhci.usb2_ports_count() {
-        let port = xhci.usb2_ports[index] as usize;
-        let portsc = xhci.regs.portsc(port);
-
-        serial::write_str("USB: USB2 port ");
-        serial::write_usize(port);
-        serial::write_str(" PORTSC=0x");
-        serial::write_hex(portsc as u64);
-        serial::write_str("\n");
-
-        if xhci.regs.port_connected(port) {
-            serial::write_str("USB: connected USB2 device detected on port ");
-            serial::write_usize(port);
-            serial::write_str("\n");
-
-            test_port = Some(port);
-            break;
-        }
-    }
-
-    // Report connected USB3 ports too, but do not feed them into reset_port().
-    for index in 0..xhci.usb3_ports_count() {
-        let port = xhci.usb3_ports[index] as usize;
-        let portsc = xhci.regs.portsc(port);
-
-        if xhci.regs.port_connected(port) {
-            serial::write_str("USB: connected USB3 device detected on port ");
-            serial::write_usize(port);
-            serial::write_str(" PORTSC=0x");
-            serial::write_hex(portsc as u64);
-            serial::write_str("; normal USB2 PORT_RESET will NOT be issued\n");
-        }
     }
 
     // ========================================================
@@ -564,21 +507,19 @@ pub fn init() {
     let mut hid = HidManager::new();
 
     // ========================================================
-    // No connected USB2 device
+    // Find a ready root port
     // ========================================================
 
+    let test_port = unsafe { find_enumeration_port(&mut xhci) };
+
     let Some(test_port) = test_port else {
-        serial::write_str("USB: no connected USB2 root port found\n");
-        serial::write_str("USB: skipping USB2 enumeration test\n");
+        serial::write_str("USB: no enumeration-ready USB root port found\n");
 
         let hid_has_keyboard = hid.has_keyboard();
         let hid_has_mouse = hid.has_mouse();
 
         unsafe {
-            (*USB_STORAGE.state.get()).write(UsbState {
-                xhci,
-                hid,
-            });
+            (*USB_STORAGE.state.get()).write(UsbState { xhci, hid });
         }
 
         crate::input::set_keyboard_present(hid_has_keyboard);
@@ -590,200 +531,61 @@ pub fn init() {
         return;
     };
 
-    // ========================================================
-    // USB2 enumeration test
-    // ========================================================
-
-    serial::write_str("USB: enumeration test using USB2 port ");
+    serial::write_str("USB: enumeration test using port ");
     serial::write_usize(test_port);
-    serial::write_str("\n");
-
-    // ========================================================
-    // Read device speed before reset
-    // ========================================================
-
-    let before_reset_portsc = xhci.regs.portsc(test_port);
-    let before_reset_speed = ((before_reset_portsc >> 10) & 0xF) as u8;
-
-    serial::write_str("USB: device speed before reset=0x");
-    serial::write_hex(before_reset_speed as u64);
-    serial::write_str("\n");
-
-    // ========================================================
-    // Port reset
-    // ========================================================
-    //
-    // run() may already have started a non-blocking reset for this connected
-    // USB2 port.  Do not submit a second reset if one is pending.
-    //
-    // If the port is still connected + disabled + not resetting and no reset
-    // is pending, submit one now.
-    //
-    // ========================================================
-
-    let current_portsc = xhci.regs.portsc(test_port);
-
-    let connected = (current_portsc & (1 << 0)) != 0;
-    let enabled = (current_portsc & (1 << 1)) != 0;
-    let reset_active = (current_portsc & (1 << 4)) != 0;
-
-    if xhci.port_reset_pending(test_port) {
-        serial::write_str("USB: USB2 port reset already pending; waiting for completion...\n");
-    } else if connected && !enabled && !reset_active {
-        serial::write_str("USB: requesting USB2 port reset...\n");
-
-        unsafe {
-            xhci.reset_port(test_port);
-        }
-
-        serial::write_str("USB: reset_port() request submitted\n");
-    } else if connected && enabled {
-        serial::write_str(
-            "USB: USB2 port is already enabled; no second PORT_RESET will be issued\n",
-        );
+    serial::write_str(" protocol=");
+    serial::write_str(if xhci.is_usb2_port(test_port) {
+        "USB2"
+    } else if xhci.is_usb3_port(test_port) {
+        "USB3"
     } else {
-        serial::write_str("USB: USB2 port is not in a resettable state; skipping request\n");
-    }
+        "UNKNOWN"
+    });
+    serial::write_str(" speed=0x");
+    serial::write_hex(xhci.port_speed(test_port) as u64);
+    serial::write_str("\n");
 
-    // ========================================================
-    // Wait for reset state machine to complete
-    // ========================================================
-
-    if xhci.port_reset_pending(test_port) {
-        let reset_ready = wait_for_usb2_port_ready(&mut xhci, test_port);
-
-        serial::write_str("USB: USB2 port reset wait result=");
-        serial::write_usize(reset_ready as usize);
-        serial::write_str("\n");
-    }
-
-    // ========================================================
-    // Inspect PORTSC after reset processing
-    // ========================================================
-
-    let portsc = xhci.regs.portsc(test_port);
-
-    serial::write_str("USB: PORTSC after reset processing=0x");
+    // At this point the xHCI driver has completed its port state machine. Do
+    // not clear PRC/WRC or write PORTSC here; those change bits are owned by
+    // the driver's root-port state machine.
+    let portsc = xhci.port_status(test_port);
+    serial::write_str("USB: enumeration-ready PORTSC=0x");
     serial::write_hex(portsc as u64);
     serial::write_str("\n");
 
-    let connected = (portsc & (1 << 0)) != 0;
-    let enabled = (portsc & (1 << 1)) != 0;
-    let reset_active = (portsc & (1 << 4)) != 0;
-    let reset_change = (portsc & (1 << 21)) != 0;
-    let speed = ((portsc >> 10) & 0xF) as u8;
-    let pls = ((portsc >> 5) & 0xF) as u8;
-
-    serial::write_str("USB: after reset CCS=");
-    serial::write_usize(connected as usize);
-    serial::write_str(" PED=");
-    serial::write_usize(enabled as usize);
-    serial::write_str(" PR=");
-    serial::write_usize(reset_active as usize);
-    serial::write_str(" PRC=");
-    serial::write_usize(reset_change as usize);
-    serial::write_str(" PLS=0x");
-    serial::write_hex(pls as u64);
-    serial::write_str(" SPEED=0x");
-    serial::write_hex(speed as u64);
-    serial::write_str("\n");
-
     // ========================================================
-    // Validate reset result
+    // Enable Slot + HID enumeration
     // ========================================================
 
-    if reset_active {
-        serial::write_str("USB: WARNING: port reset is still active\n");
-    }
+    serial::write_str("USB: submitting Enable Slot command...\n");
 
-    if !connected {
-        serial::write_str("USB: WARNING: device disconnected during reset\n");
-    }
+    let slot_id = unsafe { xhci.enable_slot() };
 
-    if !enabled {
-        serial::write_str("USB: WARNING: port is not enabled after reset\n");
-    }
+    match slot_id {
+        Some(slot_id) => {
+            serial::write_str("USB: Enable Slot succeeded, slot=");
+            serial::write_hex(slot_id as u64);
+            serial::write_str("\n");
 
-    if pls != 0 {
-        serial::write_str("USB: WARNING: USB2 port is not in U0 after reset\n");
-    }
+            serial::write_str("USB: starting USB HID device enumeration...\n");
 
-    // ========================================================
-    // Clear Port Reset Change
-    // ========================================================
-    //
-    // PRC is RW1C.  We only acknowledge it AFTER interpreting the post-reset
-    // PORTSC snapshot.
-    //
-    // ========================================================
-
-    if reset_change {
-        serial::write_str("USB: clearing Port Reset Change...\n");
-
-        unsafe {
-            xhci.clear_port_reset_change(test_port);
-        }
-
-        serial::write_str("USB: Port Reset Change cleared\n");
-    } else {
-        serial::write_str("USB: no Port Reset Change bit set\n");
-    }
-
-    // ========================================================
-    // Custom USB HID enumeration
-    // ========================================================
-    //
-    // Enable Slot gives the device an xHCI Slot ID.  hid.rs then performs the
-    // real USB enumeration sequence:
-    //
-    //     Address Device
-    //     GET_DESCRIPTOR(Device)
-    //     GET_DESCRIPTOR(Configuration)
-    //     SET_CONFIGURATION
-    //     SET_PROTOCOL (boot HID)
-    //     Configure Endpoint
-    //     submit persistent interrupt-IN transfer
-    //
-    // ========================================================
-
-    if connected && enabled && !reset_active {
-        serial::write_str("USB: submitting Enable Slot command...\n");
-
-        let slot_id = unsafe {
-            xhci.enable_slot()
-        };
-
-        match slot_id {
-            Some(slot_id) => {
-                serial::write_str("USB: Enable Slot succeeded, slot=");
-                serial::write_hex(slot_id as u64);
-                serial::write_str("\n");
-
-                serial::write_str("USB: starting USB device enumeration...\n");
-
-                if unsafe {
-                    hid.enumerate_device(
-                        &mut xhci,
-                        test_port,
-                        slot_id,
-                    )
-                } {
-                    serial::write_str("USB: USB device enumeration completed\n");
-                } else {
-                    serial::write_str("USB: USB device enumeration failed\n");
-                }
-            }
-
-            None => {
-                serial::write_str("USB: Enable Slot failed\n");
+            if unsafe { hid.enumerate_device(&mut xhci, test_port, slot_id) } {
+                serial::write_str("USB: USB HID enumeration completed\n");
+            } else {
+                serial::write_str("USB: USB HID enumeration failed or device is not boot HID\n");
             }
         }
-    } else {
-        serial::write_str("USB: skipping USB enumeration because USB2 port is not ready\n");
+
+        None => {
+            // enable_slot() already prints the command/event diagnostics from
+            // inside XhciDriver. Do not attempt to manufacture a second
+            // command-ring timeout here.
+            serial::write_str("USB: Enable Slot failed\n");
+        }
     }
 
     // ========================================================
-    // Final controller state
+    // Final diagnostic state
     // ========================================================
 
     serial::write_str("USB: final xHCI controller state:\n");
@@ -800,10 +602,7 @@ pub fn init() {
     let hid_has_mouse = hid.has_mouse();
 
     unsafe {
-        (*USB_STORAGE.state.get()).write(UsbState {
-            xhci,
-            hid,
-        });
+        (*USB_STORAGE.state.get()).write(UsbState { xhci, hid });
     }
 
     crate::input::set_keyboard_present(hid_has_keyboard);
