@@ -293,20 +293,11 @@ extern "C" fn rusty_syscall_dispatch(
     interrupt: *mut UserInterruptFrame,
 ) -> u64 {
     // --------------------------------------------------------
-    // Pump USB before servicing input.
-    //
-    // This keeps CrabUSB running while userspace is executing.
-    // There is intentionally NO permanent USB loop in the boot
-    // handler, otherwise Ring 3 would never be reached.
-    // --------------------------------------------------------
-
-    service_usb();
-
-    // --------------------------------------------------------
     // Service physical mouse input.
     //
-    // USB polling above produces input events. The compositor
-    // consumes mouse events and updates only the cursor region.
+    // PS/2 input arrives through the IRQ1/IRQ12 handlers, so there is no
+    // backend to pump on this path. The compositor consumes the queued
+    // mouse events and updates only the cursor region.
     // --------------------------------------------------------
 
     service_mouse();
@@ -853,7 +844,57 @@ fn key_to_ascii(key: crate::input::Key, modifiers: crate::input::Modifiers) -> u
             }
         }
 
-        // ... existing number/punctuation mappings unchanged ...
+        // Whitespace, control and symbol keys reach userspace through the
+        // same byte channel as the letters.
+        _ => non_letter_ascii(key, shift),
+    }
+}
+
+// ============================================================
+// Number / punctuation keys
+// ============================================================
+//
+// Returns the byte produced by a key that is not a letter, or 0 when the key
+// has no ASCII output. `shift` selects the upper symbol on keys that carry one.
+//
+// ============================================================
+
+fn non_letter_ascii(key: crate::input::Key, shift: bool) -> u8 {
+    use crate::input::Key;
+
+    match key {
+        // Whitespace and control keys. The terminal app expects 0x08 for
+        // backspace and '\n' for enter.
+        Key::Space => b' ',
+        Key::Tab => b'\t',
+        Key::Enter => b'\n',
+        Key::Backspace => 0x08,
+
+        // Top row digits.
+        Key::Num1 => if shift { b'!' } else { b'1' },
+        Key::Num2 => if shift { b'@' } else { b'2' },
+        Key::Num3 => if shift { b'#' } else { b'3' },
+        Key::Num4 => if shift { b'$' } else { b'4' },
+        Key::Num5 => if shift { b'%' } else { b'5' },
+        Key::Num6 => if shift { b'^' } else { b'6' },
+        Key::Num7 => if shift { b'&' } else { b'7' },
+        Key::Num8 => if shift { b'*' } else { b'8' },
+        Key::Num9 => if shift { b'(' } else { b'9' },
+        Key::Num0 => if shift { b')' } else { b'0' },
+
+        // Punctuation.
+        Key::Minus => if shift { b'_' } else { b'-' },
+        Key::Equal => if shift { b'+' } else { b'=' },
+        Key::LeftBracket => if shift { b'{' } else { b'[' },
+        Key::RightBracket => if shift { b'}' } else { b']' },
+        Key::Backslash => if shift { b'|' } else { b'\\' },
+        Key::Semicolon => if shift { b':' } else { b';' },
+        Key::Apostrophe => if shift { b'"' } else { b'\'' },
+        Key::Grave => if shift { b'~' } else { b'`' },
+        Key::Comma => if shift { b'<' } else { b',' },
+        Key::Dot => if shift { b'>' } else { b'.' },
+        Key::Slash => if shift { b'?' } else { b'/' },
+
         _ => 0,
     }
 } // ============================================================
@@ -1322,31 +1363,23 @@ fn syscall_launch_app(frame: &SyscallFrame) -> ! {
 //
 
 // ============================================================
-// USB/input service
+// Mouse service
 // ============================================================
 //
-// USB is deliberately NOT polled from the boot handler.
+// PS/2 input is interrupt driven:
 //
-// Userspace enters the kernel through syscalls, and every
-// syscall entry pumps CrabUSB once. This allows:
+//     IRQ1 / IRQ12
+//        ↓
+//     i8042 handler
+//        ↓
+//     InputEvent queue
+//        ↓
+//     SYS_READ / compositor
 //
-//     Ring 3
-//        ↓
-//     syscall
-//        ↓
-//     USB poll
-//        ↓
-//     input events
-//        ↓
-//     return to Ring 3
+// SYS_READ can therefore yield when no keyboard event is queued,
+// and the next syscall entry will pick up whatever the handlers
+// pushed in the meantime.
 //
-// SYS_READ can therefore yield when no keyboard input exists,
-// and the next syscall/kernel entry will pump USB again.
-//
-
-fn service_usb() {
-    crate::usb::poll::poll();
-}
 
 fn service_mouse() {
     let mut wm_lock = crate::wm::WM.lock();

@@ -217,11 +217,11 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     // update_boot_status(3, 0xFFA6E3A1, "Task 4/4: Boot Sequence Complete!");
     // serial::write_str("Boot sequence finished successfully\n");
 
-    serial::write_str("BOOT: initializing USB...\n");
+    serial::write_str("BOOT: initializing PS/2 input...\n");
 
-    crate::usb::init::init();
+    crate::input::init();
 
-    serial::write_str("BOOT: USB initialization complete\n");
+    serial::write_str("BOOT: PS/2 input initialization complete\n");
 
     serial::write_str("BOOT: init interrupts\n");
 
@@ -229,9 +229,8 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
 
     serial::write_str("BOOT: interrupts loaded\n");
 
-    crate::serial::write_str("BOOT: calling USB poll...\n");
-
-    // crate::usb::poll::poll();
+    // PS/2 input is interrupt driven: events queue up in crate::input and
+    // are consumed by the compositor and the syscall layer.
 
     crate::delay::delay_seconds(1);
 

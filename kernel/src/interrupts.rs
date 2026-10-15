@@ -3,7 +3,7 @@ use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr::{read_volatile, write_volatile},
-    sync::atomic::{AtomicBool, Ordering, fence},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use pic8259::ChainedPics;
@@ -22,26 +22,46 @@ use crate::{memory, serial, syscall};
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-// Dedicated MSI/MSI-X vector for xHCI.
-// Must stay outside the remapped 8259 PIC range 32..47.
-pub const XHCI_INTERRUPT_VECTOR: u8 = 0x50;
+// Vector for the local APIC spurious-interrupt handler. It must stay
+// outside the remapped 8259 PIC range 32..47.
 pub const APIC_SPURIOUS_VECTOR: u8 = 0xFF;
+
+// ============================================================
+// PS/2 interrupt lines
+// ============================================================
+
+/// IRQ1: PS/2 keyboard.
+pub const IRQ_KEYBOARD: u8 = PIC_1_OFFSET + 1;
+
+/// IRQ2: chains the slave PIC into the master. IRQ12 never reaches the CPU
+/// while this line is masked.
+const IRQ_CASCADE: u8 = PIC_1_OFFSET + 2;
+
+/// IRQ12: PS/2 mouse (line 4 on the slave PIC).
+pub const IRQ_MOUSE: u8 = PIC_2_OFFSET + 4;
+
+/// Masks written to the 8259 PICs. Bit N of the master mask covers IRQ N;
+/// bit N of the slave mask covers IRQ N + 8. Everything else, including the
+/// unused PIT line, stays masked.
+const MASTER_IRQ_MASK: u8 = 0xFF
+    & !(1u8 << (IRQ_KEYBOARD - PIC_1_OFFSET))
+    & !(1u8 << (IRQ_CASCADE - PIC_1_OFFSET));
+
+const SLAVE_IRQ_MASK: u8 = 0xFF & !(1u8 << (IRQ_MOUSE - PIC_2_OFFSET));
 
 pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe {
     ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET)
 });
 
 // ============================================================
-// xHCI interrupt state
+// Local APIC state
 // ============================================================
 //
-// The hardware handler is deliberately tiny.  It records that the xHCI
-// controller interrupted and completes the LAPIC EOI.  Normal USB code then
-// consumes the xHCI event ring from process/context code.
-//
+// PS/2 input is delivered through the 8259 PIC, but the local APIC is still
+// enabled so that its spurious-interrupt vector remains a known, harmless
+// IDT entry.
 // ============================================================
 
-static XHCI_INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
 static LOCAL_APIC_READY: AtomicBool = AtomicBool::new(false);
 static LOCAL_APIC_X2APIC: AtomicBool = AtomicBool::new(false);
 static LOCAL_APIC_ID: core::sync::atomic::AtomicU32 =
@@ -75,7 +95,6 @@ static IDT_STORAGE: IdtStorage = IdtStorage::new();
 
 const IA32_APIC_BASE_MSR: u32 = 0x1B;
 const IA32_X2APIC_APIC_ID: u32 = 0x802;
-const IA32_X2APIC_EOI: u32 = 0x80B;
 const IA32_X2APIC_SIVR: u32 = 0x80F;
 
 const APIC_BASE_GLOBAL_ENABLE: u64 = 1 << 11;
@@ -83,7 +102,6 @@ const APIC_BASE_X2APIC_ENABLE: u64 = 1 << 10;
 const APIC_BASE_ADDRESS_MASK: u64 = 0xFFFF_FFFF_FFFF_F000;
 
 const APIC_ID_OFFSET: usize = 0x020;
-const APIC_EOI_OFFSET: usize = 0x0B0;
 const APIC_SVR_OFFSET: usize = 0x0F0;
 
 const APIC_SVR_ENABLE: u32 = 1 << 8;
@@ -204,83 +222,6 @@ unsafe fn init_local_apic() {
 }
 
 // ============================================================
-// MSI message composition
-// ============================================================
-//
-// For Rusty's current single-core/BSP use, MSI is targeted at the local APIC
-// using fixed physical delivery. Standard PCI MSI carries an 8-bit APIC
-// destination in address bits 19:12. If a future SMP implementation needs APIC
-// IDs above 255, this must be extended together with platform interrupt
-// remapping / extended-destination support.
-//
-// ============================================================
-
-pub fn msi_message(vector: u8) -> Option<(u64, u16)> {
-    if !LOCAL_APIC_READY.load(Ordering::Acquire) {
-        serial::write_str("APIC: MSI message requested before APIC initialization\n");
-        return None;
-    }
-
-    let apic_id = LOCAL_APIC_ID.load(Ordering::Acquire);
-
-    if apic_id > 0xFF {
-        serial::write_str("APIC: APIC ID exceeds 8-bit MSI destination range\n");
-        serial::write_str("APIC: interrupt remapping/extended destination support is required\n");
-        return None;
-    }
-
-    let address = 0xFEE0_0000u64 | ((apic_id as u64) << 12);
-
-    // Fixed delivery, physical destination, edge triggered/active high are
-    // represented by the default zero delivery fields; the vector occupies
-    // bits 7:0.
-    let data = vector as u16;
-
-    Some((address, data))
-}
-
-// ============================================================
-// LAPIC EOI
-// ============================================================
-
-#[inline(always)]
-pub fn lapic_eoi() {
-    if !LOCAL_APIC_READY.load(Ordering::Acquire) {
-        return;
-    }
-
-    fence(Ordering::SeqCst);
-
-    if LOCAL_APIC_X2APIC.load(Ordering::Acquire) {
-        unsafe { write_msr(IA32_X2APIC_EOI, 0) };
-    } else {
-        let base = LOCAL_APIC_BASE.load(Ordering::Acquire) as usize;
-        unsafe {
-            write_volatile((base + APIC_EOI_OFFSET) as *mut u32, 0);
-        }
-    }
-}
-
-// ============================================================
-// xHCI pending flag API
-// ============================================================
-
-#[inline(always)]
-pub fn take_xhci_interrupt() -> bool {
-    XHCI_INTERRUPT_PENDING.swap(false, Ordering::AcqRel)
-}
-
-#[inline(always)]
-pub fn clear_xhci_interrupt_pending() {
-    XHCI_INTERRUPT_PENDING.store(false, Ordering::Release);
-}
-
-#[inline(always)]
-pub fn xhci_interrupt_pending() -> bool {
-    XHCI_INTERRUPT_PENDING.load(Ordering::Acquire)
-}
-
-// ============================================================
 // Initialize IDT + PIC + LAPIC
 // ============================================================
 
@@ -293,7 +234,11 @@ pub fn init() {
     idt.double_fault.set_handler_fn(double_fault_handler);
 
     idt[PIC_1_OFFSET].set_handler_fn(timer_interrupt_handler);
-    idt[XHCI_INTERRUPT_VECTOR].set_handler_fn(xhci_interrupt_handler);
+
+    // PS/2 input lines.
+    idt[IRQ_KEYBOARD].set_handler_fn(keyboard_interrupt_handler);
+    idt[IRQ_MOUSE].set_handler_fn(mouse_interrupt_handler);
+
     idt[APIC_SPURIOUS_VECTOR].set_handler_fn(apic_spurious_interrupt_handler);
 
     unsafe {
@@ -313,7 +258,13 @@ pub fn init() {
     }
 
     unsafe {
-        PICS.lock().initialize();
+        let mut pics = PICS.lock();
+
+        pics.initialize();
+
+        // initialize() restores the mask the firmware left behind, so the
+        // lines Rusty uses are programmed explicitly instead.
+        pics.write_masks(MASTER_IRQ_MASK, SLAVE_IRQ_MASK);
     }
 
     unsafe {
@@ -344,14 +295,29 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 }
 
 // ============================================================
-// xHCI MSI/MSI-X interrupt
+// PS/2 keyboard (IRQ1)
 // ============================================================
 
-extern "x86-interrupt" fn xhci_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Never run xHCI event processing or USB enumeration from this handler.
-    // Record the interrupt and acknowledge the local APIC immediately.
-    XHCI_INTERRUPT_PENDING.store(true, Ordering::Release);
-    lapic_eoi();
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // The handler only moves bytes from the i8042 into the input queue.
+    // Decoding and event delivery stay out of interrupt context.
+    crate::input::ps2::handle_keyboard_interrupt();
+
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(IRQ_KEYBOARD);
+    }
+}
+
+// ============================================================
+// PS/2 mouse (IRQ12)
+// ============================================================
+
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::input::ps2::handle_mouse_interrupt();
+
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(IRQ_MOUSE);
+    }
 }
 
 // ============================================================
