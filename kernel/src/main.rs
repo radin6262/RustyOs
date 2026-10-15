@@ -20,10 +20,8 @@ mod process;
 mod programs;
 mod serial;
 mod syscall;
-mod usb;
 mod user;
 mod wm;
-mod xhci_pci;
 
 use bootloader_api::{
     BootInfo,

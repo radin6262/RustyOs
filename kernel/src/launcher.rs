@@ -174,11 +174,11 @@ fn draw_launcher(
     let status_y =
         panel_y + 10;
 
-    if input::usb::is_initialized() {
+    if input::is_initialized() {
         graphics::draw_string(
             status_x,
             status_y,
-            "USB: INITIALIZED",
+            "PS/2: INITIALIZED",
             graphics::Color::GREEN,
             1,
         );
@@ -186,13 +186,13 @@ fn draw_launcher(
         graphics::draw_string(
             status_x,
             status_y,
-            "USB: FAILED",
+            "PS/2: FAILED",
             graphics::Color::TEXT_DIM,
             1,
         );
     }
 
-    if input::usb::has_keyboard() {
+    if input::has_keyboard() {
         graphics::draw_string(
             status_x,
             status_y + 18,

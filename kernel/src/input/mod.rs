@@ -1,7 +1,28 @@
 #![allow(dead_code)]
 
+// ============================================================
+// Input subsystem
+// ============================================================
+//
+// Hardware backends decode their reports into a single InputEvent queue:
+//
+//     PS/2 i8042 (IRQ1 / IRQ12)
+//           |
+//           v
+//     key + mouse decoders
+//           |
+//           v
+//     KEYBOARD_EVENTS / MOUSE_EVENTS
+//           |
+//           +--> compositor (mouse)
+//           +--> syscalls   (keyboard)
+//
+// Everything above this module consumes InputEvent, so swapping the input
+// backend does not touch the window manager or userspace.
+// ============================================================
+
 pub mod key;
-pub mod usb;
+pub mod ps2;
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -73,14 +94,8 @@ static KEYBOARD_EVENTS: Mutex<VecDeque<InputEvent>> =
 static MOUSE_EVENTS: Mutex<VecDeque<InputEvent>> =
     Mutex::new(VecDeque::new());
 
-static KEYBOARD_STATE: Mutex<[u8; 8]> =
-    Mutex::new([0; 8]);
-
 static MOUSE_BUTTONS: Mutex<u8> =
     Mutex::new(0);
-
-static MOUSE_POSITION: Mutex<(i32, i32)> =
-    Mutex::new((0, 0));
 
 static MODIFIERS: Mutex<Modifiers> =
     Mutex::new(Modifiers {
@@ -102,15 +117,13 @@ static MOUSE_PRESENT: AtomicU8 =
     AtomicU8::new(0);
 
 // ============================================================
-// Initialization / compatibility
+// Initialization
 // ============================================================
 
-pub fn init(_bar0: usize) {
+pub fn init() {
     reset_input_state();
 
-    // The old API receives BAR0 from kernel_main(), but the new USB
-    // subsystem owns PCI discovery and xHCI initialization itself.
-    crate::usb::init::init();
+    ps2::init();
 }
 
 fn reset_input_state() {
@@ -124,25 +137,9 @@ fn reset_input_state() {
         queue.clear();
     }
 
-    *KEYBOARD_STATE.lock() = [0; 8];
     *MOUSE_BUTTONS.lock() = 0;
 
-    let cursor_x = (crate::graphics::width().saturating_sub(1) / 2) as i32;
-    let cursor_y = (crate::graphics::height().saturating_sub(1) / 2) as i32;
-
-    *MOUSE_POSITION.lock() = (cursor_x, cursor_y);
-
-    *MODIFIERS.lock() = Modifiers {
-        shift: false,
-        ctrl: false,
-        alt: false,
-        logo: false,
-        caps_lock: false,
-        num_lock: false,
-        scroll_lock: false,
-        left_shift: false,
-        right_shift: false,
-    };
+    *MODIFIERS.lock() = Modifiers::default();
 
     KEYBOARD_PRESENT.store(0, Ordering::Release);
     MOUSE_PRESENT.store(0, Ordering::Release);
@@ -164,15 +161,9 @@ pub fn has_mouse() -> bool {
     MOUSE_PRESENT.load(Ordering::Acquire) != 0
 }
 
-// ============================================================
-// USB service
-// ============================================================
-
-#[inline]
-fn service_usb() {
-    if crate::usb::init::is_initialized() {
-        crate::usb::poll::poll();
-    }
+/// True once the PS/2 controller has been brought up.
+pub fn is_initialized() -> bool {
+    ps2::is_initialized()
 }
 
 // ============================================================
@@ -180,8 +171,6 @@ fn service_usb() {
 // ============================================================
 
 pub fn read_key() -> Option<Key> {
-    service_usb();
-
     let event = poll_keyboard_event()?;
 
     match event {
@@ -195,7 +184,31 @@ pub fn read_key() -> Option<Key> {
 }
 
 pub fn poll_keyboard_event() -> Option<InputEvent> {
+    report_first_key();
+
     KEYBOARD_EVENTS.lock().pop_front()
+}
+
+/// One-shot diagnostic: the IRQ handler records the first decoded key press and
+/// it is reported from here, because printing needs the serial lock and normal
+/// context must be the one to take it. The produced character is included, so a
+/// wrong key mapping shows up on the serial log.
+fn report_first_key() {
+    let Some((scancode, key)) = ps2::keyboard::take_first_key() else {
+        return;
+    };
+
+    crate::serial::write_str("PS/2: keyboard input, first scancode=");
+    crate::serial::write_hex(scancode as u64);
+
+    if let Some(Key::Character(character)) = key_to_character(key, modifiers()) {
+        let mut buffer = [0u8; 4];
+
+        crate::serial::write_str(" key=");
+        crate::serial::write_str(character.encode_utf8(&mut buffer));
+    }
+
+    crate::serial::write_str("\n");
 }
 
 // ============================================================
@@ -203,176 +216,100 @@ pub fn poll_keyboard_event() -> Option<InputEvent> {
 // ============================================================
 
 pub fn poll_mouse_event() -> Option<InputEvent> {
-    service_usb();
+    report_first_mouse_packet();
+
     MOUSE_EVENTS.lock().pop_front()
 }
 
-// ============================================================
-// HID keyboard report processing
-// ============================================================
-//
-// Boot-protocol keyboard report:
-//
-//   byte 0 = modifier bits
-//   byte 1 = reserved
-//   bytes 2..8 = six simultaneous key usages
-//
-// ============================================================
-
-pub fn process_keyboard_report(report: &[u8]) {
-    if report.len() < 2 {
+/// One-shot diagnostic mirroring report_first_scancode(). The raw packet is
+/// printed so a wrong axis, sync or wheel byte is visible on the serial log.
+fn report_first_mouse_packet() {
+    let Some((packet, size)) = ps2::mouse::take_first_packet() else {
         return;
-    }
+    };
 
-    KEYBOARD_PRESENT.store(1, Ordering::Release);
-
-    let modifier_bits = report[0];
-
-    let mut modifiers = *MODIFIERS.lock();
-
-    modifiers.left_shift = (modifier_bits & (1 << 1)) != 0;
-    modifiers.right_shift = (modifier_bits & (1 << 5)) != 0;
-    modifiers.shift = modifiers.left_shift || modifiers.right_shift;
-    modifiers.ctrl = (modifier_bits & 0x11) != 0;
-    modifiers.alt = (modifier_bits & 0x44) != 0;
-    modifiers.logo = (modifier_bits & 0x88) != 0;
-
-    let mut current = [0u8; 8];
-    current[0] = modifier_bits;
-
-    let key_count = report.len().saturating_sub(2).min(6);
-    for index in 0..key_count {
-        current[index + 2] = report[index + 2];
-    }
-
-    let previous = *KEYBOARD_STATE.lock();
-
-    // Lock-state keys toggle when the corresponding usage first appears.
-    for index in 2..8 {
-        let usage = current[index];
-        if usage == 0 || usage == 0x01 {
-            continue;
-        }
-
-        if !contains_usage(&previous[2..8], usage) {
-            match usage {
-                0x39 => modifiers.caps_lock = !modifiers.caps_lock,
-                0x53 => modifiers.num_lock = !modifiers.num_lock,
-                0x47 => modifiers.scroll_lock = !modifiers.scroll_lock,
-                _ => {}
-            }
-        }
-    }
-
-    {
-        let mut modifier_state = MODIFIERS.lock();
-        *modifier_state = modifiers;
-    }
-
-    // New key-downs.
-    for index in 2..8 {
-        let usage = current[index];
-
-        if usage == 0 || usage == 0x01 {
-            continue;
-        }
-
-        if contains_usage(&previous[2..8], usage) {
-            continue;
-        }
-
-        let Some(key) = usage_to_key(usage) else {
-            continue;
-        };
-
-        push_keyboard_event(InputEvent::KeyDown {
-            key,
-            modifiers,
-        });
-    }
-
-    // Key releases.
-    for index in 2..8 {
-        let usage = previous[index];
-
-        if usage == 0 || usage == 0x01 {
-            continue;
-        }
-
-        if contains_usage(&current[2..8], usage) {
-            continue;
-        }
-
-        let Some(key) = usage_to_key(usage) else {
-            continue;
-        };
-
-        push_keyboard_event(InputEvent::KeyUp {
-            key,
-            modifiers,
-        });
-    }
-
-    *KEYBOARD_STATE.lock() = current;
+    crate::serial::write_str("PS/2: mouse reports input, bytes=");
+    crate::serial::write_usize(size);
+    crate::serial::write_str(" flags=");
+    crate::serial::write_hex(packet[0] as u64);
+    crate::serial::write_str(" dx=");
+    crate::serial::write_hex((packet[1] as i8 as i64) as u64);
+    crate::serial::write_str(" dy=");
+    crate::serial::write_hex((packet[2] as i8 as i64) as u64);
+    crate::serial::write_str("\n");
 }
 
 // ============================================================
-// HID mouse report processing
+// Backend hooks
 // ============================================================
 //
-// Boot-protocol mouse report:
-//
-//   byte 0 = buttons
-//   byte 1 = relative X
-//   byte 2 = relative Y
-//   byte 3 = wheel (when present)
-//
+// Used by crate::input::ps2 to publish decoded input. Keeping the queue
+// ownership here means every backend shares one cursor position, one
+// modifier state and one button state.
 // ============================================================
 
-pub fn process_mouse_report(report: &[u8]) {
-    if report.len() < 3 {
+pub(crate) fn push_keyboard_event(event: InputEvent) {
+    let mut queue = KEYBOARD_EVENTS.lock();
+
+    if queue.len() >= EVENT_QUEUE_LIMIT {
+        queue.pop_front();
+    }
+
+    queue.push_back(event);
+}
+
+pub(crate) fn push_mouse_event(event: InputEvent) {
+    let mut queue = MOUSE_EVENTS.lock();
+
+    if queue.len() >= EVENT_QUEUE_LIMIT {
+        queue.pop_front();
+    }
+
+    queue.push_back(event);
+}
+
+pub(crate) fn modifiers() -> Modifiers {
+    *MODIFIERS.lock()
+}
+
+pub(crate) fn update_modifiers<F>(update: F)
+where
+    F: FnOnce(&mut Modifiers),
+{
+    let mut state = MODIFIERS.lock();
+
+    update(&mut state);
+}
+
+/// Publishes a relative mouse movement.
+///
+/// MouseMove carries a delta, not a position: the compositor accumulates it
+/// into its own cursor coordinates and clamps them to the framebuffer.
+pub(crate) fn move_mouse(dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
         return;
     }
 
-    MOUSE_PRESENT.store(1, Ordering::Release);
+    push_mouse_event(InputEvent::MouseMove {
+        x: dx,
+        y: dy,
+    });
+}
 
-    let buttons = report[0] & 0x1F;
-    let previous = *MOUSE_BUTTONS.lock();
+/// Publishes every button transition between the previous and the new
+/// button bitmask (bit0 left, bit1 right, bit2 middle, bit3/4 extras).
+pub(crate) fn set_mouse_buttons(buttons: u8) {
+    let previous = {
+        let mut state = MOUSE_BUTTONS.lock();
 
-    let dx = report[1] as i8 as i32;
-    let dy = report[2] as i8 as i32;
+        let previous = *state;
+        *state = buttons;
 
-    if dx != 0 || dy != 0 {
-        let (x, y) = {
-            let mut position = MOUSE_POSITION.lock();
+        previous
+    };
 
-            let max_x = crate::graphics::width()
-                .saturating_sub(1) as i32;
-            let max_y = crate::graphics::height()
-                .saturating_sub(1) as i32;
-
-            let next_x = position.0.saturating_add(dx);
-            let next_y = position.1.saturating_add(dy);
-
-            position.0 = if max_x <= 0 {
-                0
-            } else {
-                next_x.clamp(0, max_x)
-            };
-
-            position.1 = if max_y <= 0 {
-                0
-            } else {
-                next_y.clamp(0, max_y)
-            };
-
-            *position
-        };
-
-        push_mouse_event(InputEvent::MouseMove {
-            x,
-            y,
-        });
+    if previous == buttons {
+        return;
     }
 
     let button_map = [
@@ -393,122 +330,16 @@ pub fn process_mouse_report(report: &[u8]) {
             push_mouse_event(InputEvent::MouseButtonUp(button));
         }
     }
+}
 
-    if report.len() >= 4 {
-        let wheel = report[3] as i8 as i16;
-
-        if wheel != 0 {
-            push_mouse_event(InputEvent::MouseWheel {
-                delta: wheel,
-            });
-        }
+pub(crate) fn mouse_wheel(delta: i16) {
+    if delta == 0 {
+        return;
     }
 
-    *MOUSE_BUTTONS.lock() = buttons;
-}
-
-// ============================================================
-// Queue helpers
-// ============================================================
-
-fn push_keyboard_event(event: InputEvent) {
-    let mut queue = KEYBOARD_EVENTS.lock();
-
-    if queue.len() >= EVENT_QUEUE_LIMIT {
-        queue.pop_front();
-    }
-
-    queue.push_back(event);
-}
-
-fn push_mouse_event(event: InputEvent) {
-    let mut queue = MOUSE_EVENTS.lock();
-
-    if queue.len() >= EVENT_QUEUE_LIMIT {
-        queue.pop_front();
-    }
-
-    queue.push_back(event);
-}
-
-fn contains_usage(report: &[u8], usage: u8) -> bool {
-    report.iter().any(|&value| value == usage)
-}
-
-// ============================================================
-// HID usage -> physical key
-// ============================================================
-
-fn usage_to_key(usage: u8) -> Option<Key> {
-    Some(match usage {
-        // A-Z
-        0x04 => Key::A,
-        0x05 => Key::B,
-        0x06 => Key::C,
-        0x07 => Key::D,
-        0x08 => Key::E,
-        0x09 => Key::F,
-        0x0A => Key::G,
-        0x0B => Key::H,
-        0x0C => Key::I,
-        0x0D => Key::J,
-        0x0E => Key::K,
-        0x0F => Key::L,
-        0x10 => Key::M,
-        0x11 => Key::N,
-        0x12 => Key::O,
-        0x13 => Key::P,
-        0x14 => Key::Q,
-        0x15 => Key::R,
-        0x16 => Key::S,
-        0x17 => Key::T,
-        0x18 => Key::U,
-        0x19 => Key::V,
-        0x1A => Key::W,
-        0x1B => Key::X,
-        0x1C => Key::Y,
-        0x1D => Key::Z,
-
-        // Numbers
-        0x1E => Key::Num1,
-        0x1F => Key::Num2,
-        0x20 => Key::Num3,
-        0x21 => Key::Num4,
-        0x22 => Key::Num5,
-        0x23 => Key::Num6,
-        0x24 => Key::Num7,
-        0x25 => Key::Num8,
-        0x26 => Key::Num9,
-        0x27 => Key::Num0,
-
-        // Controls
-        0x28 => Key::Enter,
-        0x29 => Key::Escape,
-        0x2A => Key::Backspace,
-        0x2B => Key::Tab,
-        0x2C => Key::Space,
-
-        // Punctuation
-        0x2D => Key::Minus,
-        0x2E => Key::Equal,
-        0x2F => Key::LeftBracket,
-        0x30 => Key::RightBracket,
-        0x31 => Key::Backslash,
-        0x33 => Key::Semicolon,
-        0x34 => Key::Apostrophe,
-        0x35 => Key::Grave,
-        0x36 => Key::Comma,
-        0x37 => Key::Dot,
-        0x38 => Key::Slash,
-
-        // Navigation
-        0x4F => Key::Right,
-        0x50 => Key::Left,
-        0x51 => Key::Down,
-        0x52 => Key::Up,
-
-        _ => return None,
-    })
+    push_mouse_event(InputEvent::MouseWheel {
+        delta,
+    });
 }
 
 // ============================================================

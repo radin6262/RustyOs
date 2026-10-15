@@ -1,5 +1,4 @@
 mod allocator;
-pub mod dma;
 mod user;
 
 use core::{

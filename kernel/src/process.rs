@@ -235,12 +235,14 @@ impl Process {
                     .user_code
                     .0 as u64,
 
-                // Required RFLAGS bit.
+                // Required RFLAGS bit, plus IF.
                 //
-                // IF remains clear until the userspace
-                // interrupt/timer path is ready.
+                // Ring 3 runs with interrupts enabled so the PS/2 input
+                // handlers (IRQ1/IRQ12) can queue events while userspace
+                // executes. Every kernel entry path uses an interrupt gate,
+                // which clears IF, so kernel code never runs with IF set.
                 rflags:
-                1 << 1,
+                (1 << 1) | (1 << 9),
 
                 rsp:
                 address_space

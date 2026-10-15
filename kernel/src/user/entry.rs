@@ -62,14 +62,13 @@ pub unsafe fn enter(
     // --------------------------------------------------------
     // Build RFLAGS.
     //
-    // Bit 1 must always be set.
-    //
-    // IF is intentionally clear for now.
+    // Bit 1 must always be set, and IF must be set so the PS/2
+    // input handlers can deliver IRQ1/IRQ12 while userspace runs.
     // --------------------------------------------------------
 
     let rflags =
         RFlags::from_bits_retain(
-            1 << 1,
+            (1 << 1) | (1 << 9),
         );
 
     // --------------------------------------------------------

@@ -13,12 +13,13 @@ $RustyImage = Get-ChildItem `
     -Filter "rusty-uefi.img" |
     Select-Object -First 1 -ExpandProperty FullName
 
+# Input comes from QEMU's built-in PS/2 controller (i8042), which every
+# pc/q35 machine provides. Do NOT attach usb-kbd/usb-mouse here: QEMU hands the
+# host's keyboard and mouse to the newest HID handler, so USB devices would
+# starve the PS/2 ports that Rusty now drives.
 qemu-system-x86_64 `
     -machine q35 `
     -m 512M `
     -bios "C:\Program Files\qemu\OVMF.fd" `
-    -device qemu-xhci,id=xhci `
-    -device usb-kbd,bus=xhci.0 `
-    -device usb-mouse,bus=xhci.0 `
     -drive "format=raw,file=$RustyImage" `
     -serial stdio
