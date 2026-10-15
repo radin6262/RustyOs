@@ -4,6 +4,7 @@ RustyOS is a lightweight hobby operating system written in Rust.
 
 > Warning as of now only laptop keyboards and PS/2 devices are supported. Touchpads are not supported
 
+
 ## Features
 
 - UEFI boot
