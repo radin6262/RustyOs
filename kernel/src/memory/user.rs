@@ -6,9 +6,11 @@ use x86_64::{
         OffsetPageTable,
         Page,
         PageSize,
+        PageTable,
         PageTableFlags,
         PhysFrame,
         Size4KiB,
+        mapper::MapToError,
     },
 };
 
@@ -90,6 +92,266 @@ pub unsafe fn map_user_page(
             )
             .flush();
     }
+}
+
+// ============================================================
+// Map a kernel buffer into the current address space
+// ============================================================
+//
+// Used for window pixel buffers: the kernel owns the physical
+// pages and the calling userspace process gets a writable mapping
+// of exactly those pages. Writing to the returned virtual address
+// writes straight into the window, with no syscall per rectangle.
+//
+// The mapping is:
+//
+//     PRESENT | WRITABLE | USER_ACCESSIBLE | NO_EXECUTE
+//
+// Parent page tables on the path are created by the page-table
+// allocator and inherit PRESENT | WRITABLE | USER_ACCESSIBLE.
+//
+// Existing mappings for the same virtual range are dropped first so
+// the operation is idempotent.
+//
+// ============================================================
+
+pub unsafe fn map_user_buffer(
+    virtual_address: u64,
+
+    physical_address: u64,
+
+    byte_len: usize,
+) -> bool {
+    if byte_len == 0 {
+        return false;
+    }
+
+    if virtual_address & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+
+    if physical_address & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+
+    let end =
+        match virtual_address.checked_add(
+            byte_len as u64,
+        ) {
+            Some(value) =>
+                value,
+
+            None =>
+                return false,
+        };
+
+    if end > USER_MAX {
+        return false;
+    }
+
+    let level_4_frame =
+        current_level_4_frame();
+
+    let level_4_virtual =
+        super::physical_to_virtual(
+            level_4_frame
+                .start_address()
+                .as_u64(),
+        );
+
+    let level_4_table:
+        &'static mut PageTable =
+        unsafe {
+            &mut *(
+                level_4_virtual
+                    as *mut PageTable
+            )
+        };
+
+    let mut mapper =
+        unsafe {
+            OffsetPageTable::new(
+                level_4_table,
+                VirtAddr::new(
+                    super::physical_memory_offset(),
+                ),
+            )
+        };
+
+    // --------------------------------------------------------
+    // Leaf flags.
+    // --------------------------------------------------------
+
+    let flags =
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+
+    let mut frame_allocator =
+        super::allocator::PageTableFrameAllocator;
+
+    let mut offset = 0u64;
+
+    while offset < byte_len as u64 {
+        let page =
+            Page::<Size4KiB>
+            ::containing_address(
+                VirtAddr::new(
+                    virtual_address + offset,
+                ),
+            );
+
+        let frame =
+            PhysFrame::<Size4KiB>
+            ::containing_address(
+                PhysAddr::new(
+                    physical_address + offset,
+                ),
+            );
+
+        // ----------------------------------------------------
+        // Drop any previous mapping for this page so the call
+        // is repeatable.
+        // ----------------------------------------------------
+
+        unsafe {
+            unmap_page(
+                &mut mapper,
+                page.start_address(),
+            );
+        }
+
+        match unsafe {
+            mapper.map_to(
+                page,
+                frame,
+                flags,
+                &mut frame_allocator,
+            )
+        } {
+            Ok(flush) =>
+                flush.flush(),
+
+            Err(MapToError::PageAlreadyMapped(
+                existing,
+            )) => {
+                // Should be unreachable: the page was just
+                // unmapped. Fail loudly instead of silently
+                // leaving the process without a buffer.
+                crate::serial::write_str(
+                    "SHARED MEM: conflicted PA=",
+                );
+
+                crate::serial::write_hex(
+                    existing
+                        .start_address()
+                        .as_u64(),
+                );
+
+                crate::serial::write_str(
+                    "\n",
+                );
+
+                return false;
+            }
+
+            Err(_) =>
+                return false,
+        }
+
+        offset +=
+            PAGE_SIZE;
+    }
+
+    true
+}
+
+// ============================================================
+// Verify a shared userspace buffer mapping
+// ============================================================
+//
+// Confirms that every page of `[virtual_address, +byte_len)`
+// resolves to the expected physical page and carries the
+// userspace writable flags. This is the kernel-side check that the
+// shared window buffer really is shared memory and not just a
+// registered address.
+//
+// ============================================================
+
+pub unsafe fn verify_user_buffer(
+    virtual_address: u64,
+
+    physical_address: u64,
+
+    byte_len: usize,
+) -> bool {
+    if byte_len == 0 {
+        return false;
+    }
+
+    let level_4_frame =
+        current_level_4_frame();
+
+    let required =
+        PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE;
+
+    let mut offset = 0u64;
+
+    while offset < byte_len as u64 {
+        let page_address =
+            virtual_address + offset;
+
+        let expected =
+            physical_address + offset;
+
+        let actual =
+            match unsafe {
+                user_page_frame(
+                    level_4_frame,
+                    page_address,
+                )
+            } {
+                Some(frame) =>
+                    frame
+                        .start_address()
+                        .as_u64(),
+
+                None =>
+                    return false,
+            };
+
+        if actual != expected {
+            return false;
+        }
+
+        let flags =
+            match unsafe {
+                user_page_flags(
+                    level_4_frame,
+                    page_address,
+                )
+            } {
+                Some(flags) =>
+                    flags,
+
+                None =>
+                    return false,
+            };
+
+        if !flags.contains(
+            required,
+        ) {
+            return false;
+        }
+
+        offset +=
+            PAGE_SIZE;
+    }
+
+    true
 }
 
 // ============================================================

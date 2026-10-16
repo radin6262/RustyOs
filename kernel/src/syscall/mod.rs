@@ -1,4 +1,5 @@
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use x86_64::{PrivilegeLevel, VirtAddr, structures::idt::InterruptDescriptorTable};
 
@@ -30,6 +31,64 @@ pub const SYS_CLICK: u64 = 103;
 pub const SYS_DESTROY_WINDOW: u64 = 104;
 pub const SYS_LAUNCH_APP: u64 = 105;
 pub const SYS_CLICK_RECT: u64 = 106;
+
+// Returns the virtual address of a window's shared pixel buffer.
+pub const SYS_WINDOW_BUFFER: u64 = 107;
+
+// Sets the title the compositor shows in the window's title bar.
+pub const SYS_SET_WINDOW_TITLE: u64 = 108;
+
+/// Longest window title the compositor stores.
+const MAX_WINDOW_TITLE_LENGTH: usize = 64;
+
+// ============================================================
+// Legacy drawing syscall diagnostics
+// ============================================================
+//
+// Rectangle drawing moved to the shared window buffer, so an
+// application that draws correctly never reaches these syscalls.
+// The first call from userspace is reported once so the serial log
+// shows whether an application still draws one rectangle per
+// syscall.
+
+static FILL_RECT_SYSCALL_SEEN: AtomicBool =
+    AtomicBool::new(false);
+
+static DRAW_RECT_SYSCALL_SEEN: AtomicBool =
+    AtomicBool::new(false);
+
+fn report_legacy_rect_syscall(
+    seen: &AtomicBool,
+    name: &str,
+    window_id: u64,
+) {
+    if seen.swap(
+        true,
+        Ordering::AcqRel,
+    ) {
+        return;
+    }
+
+    crate::serial::write_str(
+        "SHARED MEM: ",
+    );
+
+    crate::serial::write_str(
+        name,
+    );
+
+    crate::serial::write_str(
+        " syscall used by userspace, window=",
+    );
+
+    crate::serial::write_usize(
+        window_id as usize,
+    );
+
+    crate::serial::write_str(
+        "\n",
+    );
+}
 
 const ENOSYS: u64 = u64::MAX;
 const SUCCESS: u64 = 0;
@@ -340,6 +399,10 @@ extern "C" fn rusty_syscall_dispatch(
         SYS_LAUNCH_APP => syscall_launch_app(frame),
 
         SYS_CLICK_RECT => syscall_click_rect(frame),
+
+        SYS_WINDOW_BUFFER => syscall_window_buffer(frame),
+
+        SYS_SET_WINDOW_TITLE => syscall_set_window_title(frame),
 
         _ => ENOSYS,
     }
@@ -918,6 +981,12 @@ fn syscall_sleep(_frame: &SyscallFrame) -> u64 {
 fn syscall_fill_rect(frame: &SyscallFrame) -> u64 {
     let window_id = frame.rdi;
 
+    report_legacy_rect_syscall(
+        &FILL_RECT_SYSCALL_SEEN,
+        "SYS_FILL_RECT",
+        window_id,
+    );
+
     let x = frame.rsi as usize;
 
     let y = frame.rdx as usize;
@@ -1009,6 +1078,12 @@ fn syscall_draw_string(frame: &SyscallFrame) -> u64 {
 fn syscall_draw_rect(frame: &SyscallFrame) -> u64 {
     let window_id = frame.rdi;
 
+    report_legacy_rect_syscall(
+        &DRAW_RECT_SYSCALL_SEEN,
+        "SYS_DRAW_RECT",
+        window_id,
+    );
+
     let x = frame.rsi as usize;
 
     let y = frame.rdx as usize;
@@ -1057,13 +1132,309 @@ fn syscall_create_window(frame: &SyscallFrame) -> u64 {
 
     let height = frame.r10 as usize;
 
-    let mut wm_lock = crate::wm::WM.lock();
+    let window_id = {
+        let mut wm_lock = crate::wm::WM.lock();
 
-    if let Some(ref mut compositor) = *wm_lock {
-        compositor.create_window(x, y, width, height)
-    } else {
-        0
+        match *wm_lock {
+            Some(ref mut compositor) =>
+                compositor.create_window(x, y, width, height),
+
+            None =>
+                0,
+        }
+    };
+
+    if window_id == 0 {
+        return 0;
     }
+
+    // --------------------------------------------------------
+    // Give the calling process a writable mapping of the new
+    // window's pixel buffer.
+    //
+    // Drawing through this mapping needs no syscall, and the
+    // compositor reads the very same physical pages when it
+    // composites the window.
+    // --------------------------------------------------------
+
+    map_window_shared_buffer(
+        window_id,
+    );
+
+    window_id
+}
+
+// ============================================================
+// SYS_WINDOW_BUFFER (#107)
+// rdi = window_id
+// ============================================================
+//
+// Returns the virtual address of the window's shared pixel buffer
+// inside the calling process:
+//
+//     *[u32]
+//
+// with exactly `width * height` pixels, row major, one u32 per
+// pixel in 0xAARRGGBB layout. The buffer is created as part of
+// SYS_CREATE_WINDOW, so this call normally just reports the
+// address.
+//
+// Returns 0 when the window does not exist, when it cannot be
+// mapped, or when the address space reserved for shared window
+// buffers is exhausted.
+//
+
+fn syscall_window_buffer(frame: &SyscallFrame) -> u64 {
+    let window_id = frame.rdi;
+
+    let mapped = {
+        let wm_lock = crate::wm::WM.lock();
+
+        match *wm_lock {
+            Some(ref compositor) =>
+                compositor.window_buffer_va(
+                    window_id,
+                ),
+
+            None =>
+                None,
+        }
+    };
+
+    if let Some(virtual_address) = mapped {
+        return virtual_address;
+    }
+
+    // Not mapped yet: the window may have been created before the
+    // process asked for its buffer (or by kernel code).
+    map_window_shared_buffer(
+        window_id,
+    )
+}
+
+// ============================================================
+// SYS_SET_WINDOW_TITLE (#108)
+// rdi = window_id
+// rsi = title pointer
+// rdx = title length
+// ============================================================
+//
+// The compositor draws this text in the window's title bar and in
+// the menu bar, so applications should set it right after creating
+// a window.
+//
+
+fn syscall_set_window_title(frame: &SyscallFrame) -> u64 {
+    let window_id = frame.rdi;
+
+    let title_address = frame.rsi;
+
+    let title_length = frame.rdx as usize;
+
+    if title_length > MAX_WINDOW_TITLE_LENGTH {
+        return 0;
+    }
+
+    // --------------------------------------------------------
+    // Validate the userspace range before reading it.
+    // --------------------------------------------------------
+
+    if title_length > 0
+        && !unsafe {
+            crate::memory::validate_user_range(
+                crate::memory::current_level_4_frame(),
+                title_address,
+                title_length,
+                false,
+            )
+        }
+    {
+        return 0;
+    }
+
+    let bytes =
+        if title_length == 0 {
+            &[][..]
+        } else {
+            unsafe {
+                core::slice::from_raw_parts(
+                    title_address as *const u8,
+                    title_length,
+                )
+            }
+        };
+
+    let Ok(title) =
+        core::str::from_utf8(
+            bytes,
+        )
+    else {
+        return 0;
+    };
+
+    let mut wm_lock =
+        crate::wm::WM.lock();
+
+    let Some(ref mut compositor) =
+        *wm_lock
+    else {
+        return 0;
+    };
+
+    let Some(window) =
+        compositor.windows.get_mut(
+            &window_id,
+        )
+    else {
+        return 0;
+    };
+
+    window.set_title(
+        title,
+    );
+
+    1
+}
+
+// ============================================================
+// Window shared buffer mapping
+// ============================================================
+//
+// Maps a window's kernel pixel buffer into the calling process, so
+// the application draws by writing memory instead of issuing a
+// syscall per rectangle.
+//
+// Returns the virtual address of the mapping, or 0 when the window
+// does not exist or the mapping could not be established and
+// verified.
+//
+// The mapping is verified with a page-table walk before it is
+// published: the address is only handed to userspace once every
+// page resolves to the window's own physical frame and carries
+// PRESENT | WRITABLE | USER_ACCESSIBLE.
+//
+
+fn map_window_shared_buffer(window_id: u64) -> u64 {
+    let (physical_address, byte_len) = {
+        let wm_lock = crate::wm::WM.lock();
+
+        let Some(ref compositor) = *wm_lock else {
+            return 0;
+        };
+
+        match compositor.shared_buffer_info(window_id) {
+            Some(info) => info,
+
+            None => {
+                crate::serial::write_str(
+                    "SHARED MEM: no such window id=",
+                );
+
+                crate::serial::write_usize(window_id as usize);
+
+                crate::serial::write_str("\n");
+
+                return 0;
+            }
+        }
+    };
+
+    // --------------------------------------------------------
+    // The buffer must fit inside one slot, otherwise the mapping
+    // would spill into the next window's slot.
+    // --------------------------------------------------------
+
+    if byte_len as u64
+        > crate::user::address_space::USER_FRAMEBUFFER_SLOT_SIZE
+    {
+        crate::serial::write_str(
+            "SHARED MEM: window buffer too large for slot, window=",
+        );
+
+        crate::serial::write_usize(window_id as usize);
+
+        crate::serial::write_str("\n");
+
+        return 0;
+    }
+
+    let Some(virtual_address) = crate::user::address_space::user_framebuffer_slot(window_id)
+    else {
+        crate::serial::write_str(
+            "SHARED MEM: no slot for window id=",
+        );
+
+        crate::serial::write_usize(window_id as usize);
+
+        crate::serial::write_str("\n");
+
+        return 0;
+    };
+
+    if !unsafe {
+        crate::memory::map_user_buffer(
+            virtual_address,
+            physical_address,
+            byte_len,
+        )
+    } {
+        crate::serial::write_str(
+            "SHARED MEM: mapping failed window=",
+        );
+
+        crate::serial::write_usize(window_id as usize);
+
+        crate::serial::write_str("\n");
+
+        return 0;
+    }
+
+    if !unsafe {
+        crate::memory::verify_user_buffer(
+            virtual_address,
+            physical_address,
+            byte_len,
+        )
+    } {
+        crate::serial::write_str(
+            "SHARED MEM: verification FAILED window=",
+        );
+
+        crate::serial::write_usize(window_id as usize);
+
+        crate::serial::write_str("\n");
+
+        return 0;
+    }
+
+    if let Some(ref mut compositor) = *crate::wm::WM.lock() {
+        compositor.set_window_buffer_va(
+            window_id,
+            virtual_address,
+        );
+    }
+
+    crate::serial::write_str(
+        "SHARED MEM: window ",
+    );
+
+    crate::serial::write_usize(window_id as usize);
+
+    crate::serial::write_str(" VA=");
+
+    crate::serial::write_hex(virtual_address);
+
+    crate::serial::write_str(" PA=");
+
+    crate::serial::write_hex(physical_address);
+
+    crate::serial::write_str(" bytes=");
+
+    crate::serial::write_usize(byte_len);
+
+    crate::serial::write_str(" BACKED\n");
+
+    virtual_address
 }
 
 // ============================================================
