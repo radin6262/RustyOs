@@ -2,6 +2,8 @@
 
 pub mod window;
 pub mod compositor;
+pub mod chrome;
+pub mod surface;
 
 pub use window::Window;
 pub use compositor::{Compositor, WM};

@@ -2,10 +2,21 @@
 
 extern crate alloc;
 
+use alloc::alloc::{
+    Layout,
+    alloc,
+};
 use alloc::vec::Vec;
 
-use crate::font;
 use crate::graphics::Color;
+use crate::memory::PAGE_SIZE;
+
+// ============================================================
+// Window background color
+// ============================================================
+
+const DEFAULT_WINDOW_COLOR: u32 =
+    0xFF181825;
 
 // ============================================================
 // Window limits
@@ -23,6 +34,118 @@ const MAX_WINDOW_HEIGHT: usize = 4096;
 const MAX_WINDOW_PIXELS: usize = 16 * 1024 * 1024;
 
 // ============================================================
+// Pixel buffer allocation
+// ============================================================
+//
+// A window pixel buffer is page aligned and physically contiguous
+// so that it can be mapped into the owning userspace process as
+// shared memory. That mapping is what lets an application draw
+// straight into its window instead of issuing a syscall for every
+// rectangle.
+//
+// The kernel heap is identity mapped (see `memory::init`), so the
+// pointer handed out by the global allocator is also the physical
+// address of the buffer. `allocate_frame` in the memory allocator
+// relies on the same property.
+//
+// The buffer is intentionally never freed: the kernel heap is a
+// monotonic bump allocator with no reclamation.
+//
+
+fn allocate_pixel_buffer(
+    pixel_count: usize,
+) -> (&'static mut [u32], u64) {
+    let byte_size =
+        pixel_count
+            .checked_mul(
+                core::mem::size_of::<u32>(),
+            )
+            .expect(
+                "Rusty: window pixel buffer overflow",
+            );
+
+    // --------------------------------------------------------
+    // Round the allocation up to whole pages.
+    //
+    // The mapping handed to userspace covers whole pages, so the
+    // last page of the buffer must belong to the buffer. Otherwise
+    // the tail of that page would be neighbouring kernel heap
+    // memory exposed as writable userspace memory.
+    // --------------------------------------------------------
+
+    let aligned_size =
+        crate::memory::align_up(
+            byte_size as u64,
+            PAGE_SIZE,
+        )
+            .expect(
+                "Rusty: window pixel buffer alignment overflow",
+            ) as usize;
+
+    let layout =
+        Layout::from_size_align(
+            aligned_size,
+            PAGE_SIZE as usize,
+        )
+            .expect(
+                "Rusty: invalid window pixel buffer layout",
+            );
+
+    let pointer =
+        unsafe {
+            alloc(layout)
+        } as *mut u32;
+
+    assert!(
+        !pointer.is_null(),
+        "Rusty: failed to allocate window pixel buffer",
+    );
+
+    assert_eq!(
+        (pointer as u64) & (PAGE_SIZE - 1),
+        0,
+        "Rusty: window pixel buffer is not page aligned",
+    );
+
+    // --------------------------------------------------------
+    // Confirm the identity mapping before the address is handed
+    // to the page tables: userspace must write into these very
+    // physical pages, because the compositor reads the buffer
+    // through this pointer.
+    // --------------------------------------------------------
+
+    let translated =
+        crate::memory::virtual_to_physical(
+            pointer as u64,
+        )
+            .expect(
+                "Rusty: window pixel buffer is not mapped",
+            );
+
+    assert_eq!(
+        translated, pointer as u64,
+        "Rusty: window pixel buffer is not identity mapped",
+    );
+
+    let pixels =
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                pointer,
+                pixel_count,
+            )
+        };
+
+    pixels.fill(
+        DEFAULT_WINDOW_COLOR,
+    );
+
+    (
+        pixels,
+        pointer as u64,
+    )
+}
+
+// ============================================================
 // Window
 // ============================================================
 
@@ -36,7 +159,20 @@ pub struct Window {
     pub height: usize,
 
     /// Window-owned ARGB/XRGB pixel buffer.
-    pub pixels: Vec<u32>,
+    ///
+    /// Page aligned and physically contiguous, so it can be mapped
+    /// into the owning userspace process.
+    pub pixels: &'static mut [u32],
+
+    /// Physical address of `pixels[0]`.
+    pub buffer_physical: u64,
+
+    /// Virtual address at which `pixels` is mapped inside the owning
+    /// userspace process.
+    ///
+    /// Zero while the window has no shared mapping. Kernel-owned
+    /// windows (for example the serial log window) stay at zero.
+    pub buffer_va: u64,
 
     pub z_index: usize,
 
@@ -67,8 +203,13 @@ impl Window {
 
         assert!(pixel_count <= MAX_WINDOW_PIXELS, "Rusty: window is too large");
 
-        let mut pixels = Vec::with_capacity(pixel_count);
-        pixels.resize(pixel_count, 0xFF181825);
+        let (
+            pixels,
+            buffer_physical,
+        ) =
+            allocate_pixel_buffer(
+                pixel_count,
+            );
 
         Self {
             id,
@@ -77,6 +218,8 @@ impl Window {
             width,
             height,
             pixels,
+            buffer_physical,
+            buffer_va: 0,
             z_index,
             title: Vec::new(),
         }
@@ -142,80 +285,72 @@ impl Window {
         color: Color,
         scale: usize,
     ) {
-        if text.is_empty() || scale == 0 {
-            return;
-        }
+        crate::wm::surface::Surface::new(
+            &mut self.pixels,
+            self.width,
+            self.height,
+        )
+            .text(
+                x,
+                y,
+                text,
+                color,
+                scale,
+            );
+    }
 
-        let pixel_size = (16 * scale) as f32;
-        let ascent = font::ascent(pixel_size) as i32;
-        let line_height = font::line_height(pixel_size).max(1) as i32;
+    // ========================================================
+    // Shared buffer
+    // ========================================================
 
-        let mut cursor_x = x as i32;
-        let mut cursor_y = y as i32;
+    /// Size of the pixel buffer in bytes.
+    pub fn buffer_byte_len(
+        &self,
+    ) -> usize {
+        self.pixels
+            .len()
+            .saturating_mul(
+                core::mem::size_of::<u32>(),
+            )
+    }
 
-        for character in text.chars() {
-            if character == '\n' {
-                cursor_x = x as i32;
-                cursor_y = cursor_y.saturating_add(line_height);
+    /// Size of the shared mapping created for this window.
+    ///
+    /// The pixel bytes rounded up to whole pages: the buffer is
+    /// allocated that way so the final mapped page never contains
+    /// neighbouring kernel memory.
+    pub fn buffer_map_byte_len(
+        &self,
+    ) -> usize {
+        crate::memory::align_up(
+            self.buffer_byte_len() as u64,
+            PAGE_SIZE,
+        )
+            .unwrap_or(
+                self.buffer_byte_len()
+                    as u64,
+            ) as usize
+    }
 
-                if cursor_y >= self.height as i32 {
-                    break;
-                }
-                continue;
-            }
+    /// Record the virtual address this window's pixel buffer is mapped
+    /// at inside the owning process.
+    pub fn set_buffer_va(
+        &mut self,
+        virtual_address: u64,
+    ) {
+        self.buffer_va =
+            virtual_address;
+    }
 
-            if character == '\r' {
-                cursor_x = x as i32;
-                continue;
-            }
-
-            let Some((metrics, bitmap)) = font::rasterize(character, pixel_size) else {
-                let adv = font::advance(character, pixel_size).max(pixel_size / 2.0);
-                cursor_x = cursor_x.saturating_add(adv as i32);
-                continue;
-            };
-
-            let baseline = cursor_y.saturating_add(ascent);
-
-            for glyph_y in 0..metrics.height {
-                let dst_y = baseline
-                    .saturating_add(metrics.offset_y)
-                    .saturating_add(glyph_y as i32);
-
-                if dst_y < 0 || dst_y >= self.height as i32 {
-                    continue;
-                }
-
-                let dst_y_usize = dst_y as usize;
-
-                for glyph_x in 0..metrics.width {
-                    let alpha = bitmap[glyph_y * metrics.width + glyph_x];
-
-                    if alpha == 0 {
-                        continue;
-                    }
-
-                    let dst_x = cursor_x
-                        .saturating_add(metrics.offset_x)
-                        .saturating_add(glyph_x as i32);
-
-                    if dst_x < 0 || dst_x >= self.width as i32 {
-                        continue;
-                    }
-
-                    let dst_x_usize = dst_x as usize;
-                    let index = dst_y_usize * self.width + dst_x_usize;
-
-                    self.pixels[index] = blend_pixel(self.pixels[index], color, alpha);
-                }
-            }
-
-            let advance = metrics.advance_width.max(0.0);
-            cursor_x = cursor_x.saturating_add(advance as i32);
-
-            if cursor_x >= self.width as i32 {
-                break;
-            }
+    /// Virtual address of the shared pixel buffer, or `None` when the
+    /// window has no userspace mapping.
+    pub fn shared_buffer_address(
+        &self,
+    ) -> Option<u64> {
+        if self.buffer_va == 0 {
+            None
+        } else {
+            Some(self.buffer_va)
         }
     }
 
@@ -231,42 +366,4 @@ impl Window {
     pub fn title(&self) -> &str {
         core::str::from_utf8(&self.title).unwrap_or("")
     }
-}
-
-// ============================================================
-// Pixel blending
-// ============================================================
-
-fn blend_pixel(background: u32, color: Color, alpha: u8) -> u32 {
-    if alpha == 0 {
-        return background;
-    }
-
-    if alpha == 255 {
-        return color_to_argb(color);
-    }
-
-    let src_alpha = alpha as u32;
-    let inverse_alpha = 255u32.saturating_sub(src_alpha);
-
-    let background_r = (background >> 16) & 0xFF;
-    let background_g = (background >> 8) & 0xFF;
-    let background_b = background & 0xFF;
-
-    let source_r = color.r as u32;
-    let source_g = color.g as u32;
-    let source_b = color.b as u32;
-
-    let r = (source_r * src_alpha + background_r * inverse_alpha) / 255;
-    let g = (source_g * src_alpha + background_g * inverse_alpha) / 255;
-    let b = (source_b * src_alpha + background_b * inverse_alpha) / 255;
-
-    0xFF000000 | (r << 16) | (g << 8) | b
-}
-
-fn color_to_argb(color: Color) -> u32 {
-    0xFF000000
-        | ((color.r as u32) << 16)
-        | ((color.g as u32) << 8)
-        | (color.b as u32)
 }

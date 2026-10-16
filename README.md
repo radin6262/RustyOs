@@ -14,6 +14,10 @@ RustyOS is a lightweight hobby operating system written in Rust.
 - Framebuffer graphics
 - Window manager and compositor
 - Double-buffered rendering
+- Shared memory window buffers: applications draw into their window without a
+  syscall per rectangle
+- macOS style desktop chrome: menu bar, window title bars with traffic lights,
+  rounded window corners and a dock pinned to the right edge
 - PS/2 keyboard and mouse input (i8042, IRQ1/IRQ12)
 - Ring 3 userspace
 - Separate process address spaces
@@ -21,6 +25,39 @@ RustyOS is a lightweight hobby operating system written in Rust.
 - Cooperative process scheduler
 - System calls
 - Basic userspace window creation and rendering
+
+## Desktop
+
+The compositor draws a macOS style desktop: a gradient wallpaper, a
+translucent menu bar with the focused window's title, rounded windows with a
+drop shadow and a title bar carrying the traffic lights, and a translucent dock
+on the right edge with hover labels.
+
+Applications draw into their window's pixel buffer, which the kernel maps into
+their address space (`SYS_WINDOW_BUFFER`). Rectangle drawing is therefore plain
+memory access; only text still goes through the kernel, because the font
+rasterizer lives there.
+
+## Tests
+
+`tests/shm-test.mjs` boots the built UEFI image headlessly in QEMU and checks
+the desktop through serial log assertions and screendumps:
+
+```
+node tests/shm-test.mjs          # run every check
+node tests/shm-test.mjs --keep   # keep the screendumps
+```
+
+It verifies the shared window mapping (including a kernel page-table walk), that
+applications no longer use the per-rectangle syscalls while their window content
+still reaches the screen, the chrome (menu bar, traffic lights, rounded corners,
+dock and hover label) and that typing reaches the application.
+
+`tests/screendump.mjs` converts a screendump into a PNG for inspection:
+
+```
+node tests/screendump.mjs target/shm-test/before.ppm screen.png
+```
 
 ## Input
 

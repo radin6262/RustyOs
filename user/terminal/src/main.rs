@@ -55,6 +55,14 @@ pub extern "C" fn _start() -> ! {
         syscalls::exit(1);
     }
 
+    // --------------------------------------------------------
+    // Window title, shown in the desktop chrome.
+    // --------------------------------------------------------
+
+    window.set_title(
+        "Terminal",
+    );
+
     let mut lines =
         [[0u8; INPUT_MAX]; MAX_LINES];
 

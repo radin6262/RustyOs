@@ -53,6 +53,13 @@ pub struct Compositor {
     pub hardware_framebuffer: &'static mut [u32],
 
     // --------------------------------------------------------
+    // Desktop chrome
+    // --------------------------------------------------------
+
+    /// Wallpaper, menu bar, window frames and dock.
+    chrome: super::chrome::Chrome,
+
+    // --------------------------------------------------------
     // Click detection state
     // --------------------------------------------------------
 
@@ -160,6 +167,12 @@ impl Compositor {
         let initial_mouse_y =
             (height / 2) as i32;
 
+        let chrome =
+            super::chrome::Chrome::new(
+                width,
+                height,
+            );
+
         *WM.lock() = Some(
             Compositor {
                 windows: BTreeMap::new(),
@@ -169,6 +182,8 @@ impl Compositor {
                 screen_height: height,
 
                 hardware_framebuffer: hw_fb,
+
+                chrome,
 
                 // ------------------------------------------------
                 // Click detection starts completely idle.
@@ -296,6 +311,61 @@ impl Compositor {
         }
 
         false
+    }
+
+    // ========================================================
+    // Shared window buffer
+    // ========================================================
+
+    /// Physical address and byte size of a window's pixel buffer.
+    ///
+    /// This is the kernel side of a window's shared memory region
+    /// and is what gets mapped into the owning userspace process.
+    pub fn shared_buffer_info(
+        &self,
+        id: u64,
+    ) -> Option<(u64, usize)> {
+        self.windows
+            .get(
+                &id,
+            )
+            .map(|window| {
+                (
+                    window.buffer_physical,
+                    window.buffer_map_byte_len(),
+                )
+            })
+    }
+
+    /// Record the virtual address a window's pixel buffer is mapped
+    /// at inside the owning process.
+    pub fn set_window_buffer_va(
+        &mut self,
+        id: u64,
+        virtual_address: u64,
+    ) {
+        if let Some(window) =
+            self.windows.get_mut(
+                &id,
+            )
+        {
+            window.set_buffer_va(
+                virtual_address,
+            );
+        }
+    }
+
+    /// Virtual address of a window's shared pixel buffer, or `None`
+    /// when the window has no userspace mapping yet.
+    pub fn window_buffer_va(
+        &self,
+        id: u64,
+    ) -> Option<u64> {
+        self.windows
+            .get(
+                &id,
+            )?
+            .shared_buffer_address()
     }
 
     // ========================================================
@@ -831,39 +901,14 @@ impl Compositor {
         // ====================================================
         // 1. Render desktop background
         // ====================================================
+        //
+        // The wallpaper is generated once at startup, which makes
+        // this a single memory copy per frame.
 
-        for y in 0..screen_height {
-            let ratio =
-                (y * 255)
-                    / screen_height.max(1);
-
-            let r =
-                (15 + ratio / 15)
-                    as u32;
-
-            let g =
-                (23 + ratio / 10)
-                    as u32;
-
-            let b =
-                (42 + ratio / 6)
-                    as u32;
-
-            let bg_color =
-                0xFF000000
-                    | (r << 16)
-                    | (g << 8)
-                    | b;
-
-            let row_start =
-                y * screen_width;
-
-            self.backbuffer[
-                row_start
-                    ..row_start + screen_width
-                ]
-                .fill(bg_color);
-        }
+        self.backbuffer
+            .copy_from_slice(
+                self.chrome.wallpaper(),
+            );
 
         // ====================================================
         // 2. Sort windows by Z-index
@@ -931,8 +976,55 @@ impl Compositor {
                 continue;
             }
 
+            // ------------------------------------------------
+            // Shadow and frame background, so the content and its
+            // rounded corners are painted on top of them.
+            // ------------------------------------------------
+
+            self.chrome
+                .draw_window_backdrop(
+                    &mut super::surface::Surface::new(
+                        &mut backbuffer[..],
+                        screen_width,
+                        screen_height,
+                    ),
+                    win,
+                );
+
             for py in start_y..end_y {
-                for px in start_x..end_x {
+                // --------------------------------------------
+                // Rounded corners.
+                //
+                // Rows near the bottom of the frame are inset so
+                // the content stops before the rounded corner.
+                // --------------------------------------------
+
+                let inset =
+                    super::chrome::Chrome::content_row_inset(
+                        win,
+                        py as i64,
+                    );
+
+                let row_start_x =
+                    core::cmp::max(
+                        start_x as i64,
+                        win.x as i64
+                            + inset,
+                    ) as usize;
+
+                let row_end_x =
+                    core::cmp::min(
+                        end_x as i64,
+                        win.x as i64
+                            + win.width as i64
+                            - inset,
+                    ) as usize;
+
+                if row_start_x >= row_end_x {
+                    continue;
+                }
+
+                for px in row_start_x..row_end_x {
                     let win_x =
                         (
                             px as i64
@@ -1035,19 +1127,56 @@ impl Compositor {
             }
 
             // =================================================
-            // Window border
+            // Title bar
             // =================================================
 
-            Self::draw_window_border_impl(
-                backbuffer,
-                screen_width,
-                screen_height,
-                win,
-            );
+            self.chrome
+                .draw_window_title_bar(
+                    &mut super::surface::Surface::new(
+                        &mut backbuffer[..],
+                        screen_width,
+                        screen_height,
+                    ),
+                    win,
+                );
         }
 
         // ====================================================
-        // 4. Present clean backbuffer
+        // 4. Desktop chrome
+        // ====================================================
+        //
+        // The dock and the menu bar float above every window.
+
+        let focused_title =
+            self.windows
+                .values()
+                .max_by_key(|window| window.z_index)
+                .map(|window| window.title())
+                .unwrap_or("");
+
+        self.chrome
+            .draw_dock(
+                &mut super::surface::Surface::new(
+                    &mut backbuffer[..],
+                    screen_width,
+                    screen_height,
+                ),
+                self.mouse_x as i64,
+                self.mouse_y as i64,
+            );
+
+        self.chrome
+            .draw_menu_bar(
+                &mut super::surface::Surface::new(
+                    &mut backbuffer[..],
+                    screen_width,
+                    screen_height,
+                ),
+                focused_title,
+            );
+
+        // ====================================================
+        // 5. Present clean backbuffer
         // ====================================================
         //
         // The cursor is NOT part of the backbuffer.
@@ -1062,7 +1191,7 @@ impl Compositor {
             );
 
         // ====================================================
-        // 5. Draw cursor directly to hardware framebuffer
+        // 6. Draw cursor directly to hardware framebuffer
         // ====================================================
 
         Self::draw_cursor_impl(
@@ -1120,90 +1249,6 @@ impl Compositor {
                     CURSOR_COLOR,
                 );
             }
-        }
-    }
-
-    // ========================================================
-    // Window border
-    // ========================================================
-
-    fn draw_window_border_impl(
-        backbuffer: &mut [u32],
-        screen_width: usize,
-        screen_height: usize,
-        win: &Window,
-    ) {
-        let border_color =
-            0xFF45475A;
-
-        let start_x =
-            win.x;
-
-        let start_y =
-            win.y;
-
-        let end_x =
-            (win.x as i64)
-                .saturating_add(
-                    win.width as i64,
-                )
-                .saturating_sub(1);
-
-        let end_y =
-            (win.y as i64)
-                .saturating_add(
-                    win.height as i64,
-                )
-                .saturating_sub(1);
-
-        if end_x < start_x as i64
-            || end_y < start_y as i64
-        {
-            return;
-        }
-
-        for x in
-            start_x as i64..=end_x
-        {
-            Self::set_pixel_clamped_impl(
-                backbuffer,
-                screen_width,
-                screen_height,
-                x,
-                start_y as i64,
-                border_color,
-            );
-
-            Self::set_pixel_clamped_impl(
-                backbuffer,
-                screen_width,
-                screen_height,
-                x,
-                end_y,
-                border_color,
-            );
-        }
-
-        for y in
-            start_y as i64..=end_y
-        {
-            Self::set_pixel_clamped_impl(
-                backbuffer,
-                screen_width,
-                screen_height,
-                start_x as i64,
-                y,
-                border_color,
-            );
-
-            Self::set_pixel_clamped_impl(
-                backbuffer,
-                screen_width,
-                screen_height,
-                end_x,
-                y,
-                border_color,
-            );
         }
     }
 

@@ -47,12 +47,15 @@ pub use allocator::{
     copy_to_frame,
     physical_memory_offset,
     physical_to_virtual,
+    virtual_to_physical,
     zero_frame,
 };
 
 pub use user::{
+    map_user_buffer,
     map_user_page,
     validate_user_range,
+    verify_user_buffer,
 };
 
 // ============================================================

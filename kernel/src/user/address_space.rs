@@ -64,6 +64,76 @@ pub const USER_STACK_ADDRESS: u64 =
     0x0000_0060_0000_0000;
 
 // ============================================================
+// Shared window framebuffers
+// ============================================================
+//
+// Each window owns a kernel pixel buffer that is mapped into the
+// process that created the window, so the application can draw by
+// writing memory instead of issuing one syscall per rectangle.
+//
+// Region:
+//
+//     0x0000_0050_0000_0000
+//
+// which is:
+//
+//     PML4[0]
+//     PDPT[320]
+//
+// Windows are laid out in fixed slots, one per window ID:
+//
+//     slot(window_id) = base + (window_id - 1) * SLOT_SIZE
+//
+// A slot is only mapped when the window actually exists, so the
+// reservation costs nothing but virtual address space. The region
+// stays well below USER_MAX.
+//
+// ============================================================
+
+pub const USER_FRAMEBUFFER_ADDRESS: u64 =
+    0x0000_0050_0000_0000;
+
+/// Address space reserved for a single window's pixel buffer.
+///
+/// 16 MiB holds a 1024x1024 RGBA window with room to spare, and
+/// keeps every slot on a 16 MiB boundary so the slots below can
+/// never overlap.
+///
+pub const USER_FRAMEBUFFER_SLOT_SIZE: u64 =
+    16 * 1024 * 1024;
+
+/// Highest number of simultaneously shared window buffers that fit
+/// in the reserved region.
+///
+/// 256 slots × 16 MiB = 4 GiB, still far below USER_MAX.
+///
+pub const USER_FRAMEBUFFER_MAX_WINDOWS: u64 =
+    256;
+
+/// Virtual address of the shared pixel buffer slot for `window_id`
+/// (window IDs start at 1).
+///
+/// Returns `None` when the window ID is outside the reserved region.
+/// Window IDs cannot be reused today, so slot collisions are not
+/// possible.
+pub fn user_framebuffer_slot(
+    window_id: u64,
+) -> Option<u64> {
+    if window_id == 0
+        || window_id
+            > USER_FRAMEBUFFER_MAX_WINDOWS
+    {
+        return None;
+    }
+
+    Some(
+        USER_FRAMEBUFFER_ADDRESS
+            + (window_id - 1)
+                * USER_FRAMEBUFFER_SLOT_SIZE,
+    )
+}
+
+// ============================================================
 // Constants
 // ============================================================
 
