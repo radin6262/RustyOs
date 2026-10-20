@@ -7,7 +7,37 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
+use super::chrome::{
+    DockWindowState,
+    MENU_BAR_HEIGHT,
+    TrafficLight,
+};
+
 use super::window::Window;
+
+// ============================================================
+// Press routing
+// ============================================================
+
+/// What a mouse press did to the desktop.
+#[derive(Clone, Copy)]
+struct PressResult {
+    /// The chrome handled the click, so the application must not
+    /// receive it.
+    consumed: bool,
+
+    /// Windows moved, appeared or disappeared, so the desktop has to
+    /// be recomposited.
+    redraw: bool,
+}
+
+impl PressResult {
+    const IGNORED: Self =
+        Self {
+            consumed: false,
+            redraw: false,
+        };
+}
 
 pub static WM: Mutex<Option<Compositor>> =
     Mutex::new(None);
@@ -17,7 +47,7 @@ pub static WM: Mutex<Option<Compositor>> =
 // ============================================================
 
 const CURSOR_WIDTH: usize = 14;
-const CURSOR_HEIGHT: usize = 19;
+const CURSOR_HEIGHT: usize = 22;
 
 const CURSOR_OUTLINE_COLOR: u32 =
     0xFF000000;
@@ -25,9 +55,14 @@ const CURSOR_OUTLINE_COLOR: u32 =
 const CURSOR_COLOR: u32 =
     0xFFFFFFFF;
 
+/// Soft shadow drawn beneath the arrow, so it stays readable on
+/// bright parts of the wallpaper.
+const CURSOR_SHADOW_ALPHA: u8 =
+    78;
+
 // Extra pixels around the cursor used when
 // restoring the previous cursor area.
-const CURSOR_RESTORE_PADDING: i64 = 1;
+const CURSOR_RESTORE_PADDING: i64 = 4;
 
 // ============================================================
 // Mouse button bit flags
@@ -81,6 +116,23 @@ pub struct Compositor {
     ///
     /// as one real click.
     left_button_down: bool,
+
+    /// Set when the chrome consumed the current press (a traffic
+    /// light, the menu bar or the dock), so releasing the button must
+    /// not leave a stale click for the application.
+    suppress_click: bool,
+
+    /// The last mouse report changed the desktop and the next service
+    /// tick has to recomposite instead of only repainting the cursor.
+    chrome_redraw: bool,
+
+    /// Owner of a window closed with the red traffic light. The
+    /// service tick quits this process once the WM lock is released.
+    exit_pid: Option<u64>,
+
+    /// Set when the Terminal dock icon is clicked with no Terminal
+    /// window left. The idle desktop starts a fresh copy.
+    launch_requested: bool,
 
     /// Screen position where the current left-button press
     /// started.
@@ -197,6 +249,14 @@ impl Compositor {
 
                 left_button_down: false,
 
+                suppress_click: false,
+
+                chrome_redraw: false,
+
+                exit_pid: None,
+
+                launch_requested: false,
+
                 click_start_x: initial_mouse_x,
 
                 click_start_y: initial_mouse_y,
@@ -237,6 +297,7 @@ impl Compositor {
         y: i32,
         width: usize,
         height: usize,
+        owner_pid: u64,
     ) -> u64 {
         let id = self.next_window_id;
 
@@ -257,6 +318,7 @@ impl Compositor {
             width,
             height,
             z,
+            owner_pid,
         );
 
         self.windows.insert(
@@ -282,6 +344,31 @@ impl Compositor {
         self.windows
             .remove(&id)
             .is_some()
+    }
+
+    /// Remove every window owned by a process that is quitting.
+    ///
+    /// Window drop releases the pixel buffer, so quitting an app returns
+    /// its window RAM as well as its address space.
+    pub fn release_windows_owned_by(
+        &mut self,
+        pid: u64,
+    ) -> bool {
+        let ids:
+            Vec<u64> =
+            self.windows
+                .values()
+                .filter(|window| {
+                    window.owner_pid == pid
+                })
+                .map(|window| window.id)
+                .collect();
+
+        for id in &ids {
+            self.windows.remove(id);
+        }
+
+        !ids.is_empty()
     }
 
     // ========================================================
@@ -366,6 +453,304 @@ impl Compositor {
                 &id,
             )?
             .shared_buffer_address()
+    }
+
+    // ========================================================
+    // Window focus and stacking
+    // ========================================================
+
+    /// Topmost window the user can see, which is the one that owns
+    /// the focused title bar.
+    fn focused_visible_id(
+        &self,
+    ) -> Option<u64> {
+        self.windows
+            .values()
+            .filter(|window| {
+                window.is_visible()
+            })
+            .max_by_key(|window| {
+                window.z_index
+            })
+            .map(|window| window.id)
+    }
+
+    /// Move a window to the top of the stack.
+    fn raise_window(
+        &mut self,
+        id: u64,
+    ) -> bool {
+        let top =
+            self.windows
+                .values()
+                .map(|window| window.z_index)
+                .max()
+                .unwrap_or(0);
+
+        let z =
+            self.next_z_index;
+
+        let Some(window) =
+            self.windows.get_mut(&id)
+        else {
+            return false;
+        };
+
+        if window.z_index == top {
+            return false;
+        }
+
+        window.z_index = z;
+
+        self.next_z_index =
+            z.saturating_add(1);
+
+        true
+    }
+
+    /// Show the window whose title matches a dock item, restoring it
+    /// after minimize or close.
+    fn reveal_window_by_title(
+        &mut self,
+        title: &str,
+    ) -> bool {
+        let target =
+            self.windows
+                .values()
+                .filter(|window| {
+                    window
+                        .title()
+                        .eq_ignore_ascii_case(
+                            title,
+                        )
+                })
+                .max_by_key(|window| {
+                    (window.minimized, window.z_index)
+                })
+                .map(|window| window.id);
+
+        let Some(id) = target else {
+            return false;
+        };
+
+        if let Some(window) =
+            self.windows.get_mut(&id)
+        {
+            window.restore();
+        }
+
+        self.raise_window(id);
+
+        true
+    }
+
+    /// Whether the last mouse report requires a full composite.
+    pub fn take_chrome_redraw(
+        &mut self,
+    ) -> bool {
+        core::mem::take(
+            &mut self.chrome_redraw,
+        )
+    }
+
+    /// Process that must be terminated after the next composite.
+    pub fn take_exit_pid(
+        &mut self,
+    ) -> Option<u64> {
+        self.exit_pid.take()
+    }
+
+    /// Whether the dock asked for a fresh Terminal window.
+    pub fn take_launch_request(
+        &mut self,
+    ) -> bool {
+        core::mem::take(
+            &mut self.launch_requested,
+        )
+    }
+
+    // ========================================================
+    // Chrome hit testing
+    // ========================================================
+
+    /// Route a left-button press through the desktop chrome.
+    ///
+    /// The menu bar and dock float above the windows; below them the
+    /// topmost window under the pointer wins. Pressing a traffic light
+    /// performs the window action immediately, which is how the real
+    /// macOS buttons behave.
+    fn route_press(
+        &mut self,
+        x: i64,
+        y: i64,
+    ) -> PressResult {
+        // ----------------------------------------------------
+        // Menu bar takes clicks so they never leak into a window.
+        // ----------------------------------------------------
+
+        if y < MENU_BAR_HEIGHT {
+            return PressResult {
+                consumed: true,
+                redraw: false,
+            };
+        }
+
+        // ----------------------------------------------------
+        // Dock: a click on a running app's icon raises its window,
+        // brings a minimized window back, or starts a fresh Terminal
+        // when the previous one was closed and quit.
+        // ----------------------------------------------------
+
+        if self.chrome.dock_contains(x, y) {
+            if let Some(index) =
+                self.chrome.dock_item_at(x, y)
+            {
+                let label =
+                    super::chrome::DOCK_ITEMS[index]
+                        .label;
+
+                if self.reveal_window_by_title(
+                    label,
+                ) {
+                    return PressResult {
+                        consumed: true,
+                        redraw: true,
+                    };
+                }
+
+                if label.eq_ignore_ascii_case(
+                    "Terminal",
+                ) {
+                    self.launch_requested =
+                        true;
+                }
+            }
+
+            return PressResult {
+                consumed: true,
+                redraw: false,
+            };
+        }
+
+        // ----------------------------------------------------
+        // Windows, topmost first.
+        // ----------------------------------------------------
+
+        let mut order:
+            Vec<(usize, u64)> =
+            self.windows
+                .values()
+                .map(|window| {
+                    (
+                        window.z_index,
+                        window.id,
+                    )
+                })
+                .collect();
+
+        order.sort_by_key(
+            |(z, _)| *z,
+        );
+
+        for (_, id)
+        in order.into_iter().rev()
+        {
+            let Some(window) =
+                self.windows.get(&id)
+            else {
+                continue;
+            };
+
+            if !window.is_visible()
+                || !super::chrome::Chrome::frame_contains(
+                    window,
+                    x,
+                    y,
+                )
+            {
+                continue;
+            }
+
+            let light =
+                super::chrome::Chrome::traffic_light_at(
+                    window,
+                    x,
+                    y,
+                );
+
+            let in_title_bar =
+                super::chrome::Chrome::title_bar_contains(
+                    window,
+                    x,
+                    y,
+                );
+
+            // ------------------------------------------------
+            // Traffic lights.
+            // ------------------------------------------------
+
+            if let Some(light) = light {
+                match light {
+                    // Closing destroys the window and quits the
+                    // process that owns it. Removing the entry drops
+                    // the pixel buffer back into the allocator.
+                    TrafficLight::Close => {
+                        let owner =
+                            self.windows
+                                .get(&id)
+                                .map(|window| {
+                                    window.owner_pid
+                                })
+                                .unwrap_or(0);
+
+                        if owner != 0 {
+                            self.exit_pid =
+                                Some(owner);
+                        }
+
+                        self.windows
+                            .remove(&id);
+                    }
+
+                    TrafficLight::Minimize => {
+                        if let Some(window) =
+                            self.windows.get_mut(&id)
+                        {
+                            window.minimized =
+                                true;
+                        }
+                    }
+
+                    // Zoom is reserved: the pixel buffer is a
+                    // fixed size, so it would need a resize.
+                    TrafficLight::Zoom => {}
+                }
+
+                return PressResult {
+                    consumed: true,
+                    redraw: true,
+                };
+            }
+
+            // ------------------------------------------------
+            // Any other press focuses the window.
+            // ------------------------------------------------
+
+            let needs_raise =
+                self.focused_visible_id()
+                    != Some(id);
+
+            if needs_raise {
+                self.raise_window(id);
+            }
+
+            return PressResult {
+                consumed: in_title_bar,
+                redraw: needs_raise,
+            };
+        }
+
+        PressResult::IGNORED
     }
 
     // ========================================================
@@ -460,6 +845,24 @@ impl Compositor {
 
                         self.click_start_y =
                             self.mouse_y;
+
+                        // Traffic lights, the title bar and the dock
+                        // act on press, just like macOS.
+                        let result =
+                            self.route_press(
+                                self.mouse_x as i64,
+                                self.mouse_y as i64,
+                            );
+
+                        if result.consumed {
+                            self.suppress_click =
+                                true;
+                        }
+
+                        if result.redraw {
+                            self.chrome_redraw =
+                                true;
+                        }
                     }
 
                     changed = true;
@@ -488,16 +891,23 @@ impl Compositor {
                             self.left_button_down =
                                 false;
 
-                            // The click belongs to where the
-                            // physical button was pressed.
-                            self.click_x =
-                                self.click_start_x;
+                            if self.suppress_click {
+                                // The chrome handled this press;
+                                // the application must not see it.
+                                self.suppress_click =
+                                    false;
+                            } else {
+                                // The click belongs to where the
+                                // physical button was pressed.
+                                self.click_x =
+                                    self.click_start_x;
 
-                            self.click_y =
-                                self.click_start_y;
+                                self.click_y =
+                                    self.click_start_y;
 
-                            self.click_pending =
-                                true;
+                                self.click_pending =
+                                    true;
+                            }
                         }
                     }
 
@@ -924,6 +1334,21 @@ impl Compositor {
             |w| w.z_index,
         );
 
+        let focused_id =
+            sorted_windows
+                .iter()
+                .rev()
+                .find(|window| {
+                    window.is_visible()
+                })
+                .map(|window| window.id);
+
+        let mouse_x =
+            self.mouse_x as i64;
+
+        let mouse_y =
+            self.mouse_y as i64;
+
         // ====================================================
         // 3. Composite windows
         // ====================================================
@@ -932,6 +1357,26 @@ impl Compositor {
             &mut self.backbuffer;
 
         for win in sorted_windows {
+            // Minimized windows keep their buffer and geometry, but
+            // own no screen space.
+            if !win.is_visible() {
+                continue;
+            }
+
+            let controls_hovered =
+                super::chrome::Chrome::title_bar_contains(
+                    win,
+                    mouse_x,
+                    mouse_y,
+                );
+
+            let hovered_light =
+                super::chrome::Chrome::traffic_light_at(
+                    win,
+                    mouse_x,
+                    mouse_y,
+                );
+
             let start_x =
                 core::cmp::max(
                     0,
@@ -1138,6 +1583,9 @@ impl Compositor {
                         screen_height,
                     ),
                     win,
+                    Some(win.id) == focused_id,
+                    hovered_light,
+                    controls_hovered,
                 );
         }
 
@@ -1150,9 +1598,24 @@ impl Compositor {
         let focused_title =
             self.windows
                 .values()
+                .filter(|window| {
+                    window.is_visible()
+                })
                 .max_by_key(|window| window.z_index)
                 .map(|window| window.title())
                 .unwrap_or("");
+
+        // Dock indicators: one entry per open (or minimized) window.
+        let dock_windows: Vec<DockWindowState> =
+            self.windows
+                .values()
+                .map(|window| {
+                    DockWindowState {
+                        title: window.title(),
+                        minimized: window.minimized,
+                    }
+                })
+                .collect();
 
         self.chrome
             .draw_dock(
@@ -1161,8 +1624,9 @@ impl Compositor {
                     screen_width,
                     screen_height,
                 ),
-                self.mouse_x as i64,
-                self.mouse_y as i64,
+                mouse_x,
+                mouse_y,
+                &dock_windows,
             );
 
         self.chrome
@@ -1222,34 +1686,160 @@ impl Compositor {
         x: i32,
         y: i32,
     ) {
+        // Classic arrow silhouette: wide at the head, notched into
+        // a slim tail.
         const ROW_WIDTHS: &[usize] = &[
-            1, 2, 3, 4, 5, 6, 7, 8,
-            9, 10, 11, 9, 7, 5, 3, 2,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 7, 6, 5, 5, 4, 4,
+            3,
         ];
 
         let x = x as i64;
         let y = y as i64;
 
-        for (row, width)
-        in ROW_WIDTHS.iter().enumerate()
-        {
-            let row_y =
-                y + row as i64;
+        let filled =
+            |row: i64, col: i64| -> bool {
+                if row < 0
+                    || col < 0
+                {
+                    return false;
+                }
 
-            for col in 0..*width {
-                let px =
-                    x + col as i64;
+                match ROW_WIDTHS.get(row as usize) {
+                    Some(width) => (col as usize) < *width,
+
+                    None => false,
+                }
+            };
+
+        let rows =
+            ROW_WIDTHS.len() as i64;
+
+        // 1. Drop shadow, offset down-right.
+        for row in -1..=rows + 2 {
+            for col in -1..=(CURSOR_WIDTH as i64 + 1) {
+                if !filled(row - 2, col - 2) {
+                    continue;
+                }
+
+                Self::blend_pixel_clamped_impl(
+                    framebuffer,
+                    screen_width,
+                    screen_height,
+                    x + col,
+                    y + row,
+                    0x000000,
+                    CURSOR_SHADOW_ALPHA,
+                );
+            }
+        }
+
+        // 2. Dark outline, then the white body, so the pointer keeps
+        // its shape over both dark and bright backgrounds.
+        for row in -1..=rows {
+            for col in -1..=(CURSOR_WIDTH as i64) {
+                let inside =
+                    filled(row, col);
+
+                let outline =
+                    !inside
+                        && (filled(row - 1, col - 1)
+                            || filled(row - 1, col)
+                            || filled(row - 1, col + 1)
+                            || filled(row, col - 1)
+                            || filled(row, col + 1)
+                            || filled(row + 1, col - 1)
+                            || filled(row + 1, col)
+                            || filled(row + 1, col + 1));
+
+                if !inside && !outline {
+                    continue;
+                }
 
                 Self::set_pixel_clamped_impl(
                     framebuffer,
                     screen_width,
                     screen_height,
-                    px,
-                    row_y,
-                    CURSOR_COLOR,
+                    x + col,
+                    y + row,
+                    if inside {
+                        CURSOR_COLOR
+                    } else {
+                        CURSOR_OUTLINE_COLOR
+                    },
                 );
             }
         }
+    }
+
+    /// Blend one pixel with a fixed source alpha, clamped to screen.
+    fn blend_pixel_clamped_impl(
+        framebuffer: &mut [u32],
+        screen_width: usize,
+        screen_height: usize,
+        x: i64,
+        y: i64,
+        color: u32,
+        alpha: u8,
+    ) {
+        if x < 0
+            || y < 0
+            || x >= screen_width as i64
+            || y >= screen_height as i64
+        {
+            return;
+        }
+
+        if alpha == 0 {
+            return;
+        }
+
+        let index =
+            (y as usize) * screen_width
+                + x as usize;
+
+        if alpha >= 255 {
+            framebuffer[index] =
+                0xFF00_0000 | (color & 0x00FF_FFFF);
+
+            return;
+        }
+
+        let destination =
+            framebuffer[index];
+
+        let source =
+            alpha as u32;
+
+        let inverse =
+            255 - source;
+
+        let blend =
+            |dst: u32, src: u32| -> u32 {
+                (src * source
+                    + dst * inverse)
+                    / 255
+            };
+
+        let red =
+            blend(
+                (destination >> 16) & 0xFF,
+                (color >> 16) & 0xFF,
+            );
+
+        let green =
+            blend(
+                (destination >> 8) & 0xFF,
+                (color >> 8) & 0xFF,
+            );
+
+        let blue =
+            blend(
+                destination & 0xFF,
+                color & 0xFF,
+            );
+
+        framebuffer[index] =
+            0xFF00_0000 | (red << 16) | (green << 8) | blue;
     }
 
     // ========================================================

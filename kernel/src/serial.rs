@@ -278,7 +278,7 @@ pub fn enable_screen_logging() {
     // Create logger window.
     // --------------------------------------------------------
 
-    let window_id = wm.create_window(x, y, window_width, window_height);
+    let window_id = wm.create_window(x, y, window_width, window_height, 0);
 
     // --------------------------------------------------------
     // Configure logger window.

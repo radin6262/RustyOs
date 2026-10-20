@@ -223,6 +223,20 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
 
     serial::write_str("BOOT: PS/2 input initialization complete\n");
 
+    // ========================================================
+    // USB (xHCI) input
+    // ========================================================
+    //
+    // The xHCI driver is polled from the syscall entry path, so it does not
+    // need interrupts. A machine without an xHCI controller keeps working
+    // through PS/2 alone: init() logs that and returns.
+
+    serial::write_str("BOOT: initializing USB (xHCI)...\n");
+
+    crate::usb::init();
+
+    serial::write_str("BOOT: USB initialization complete\n");
+
     serial::write_str("BOOT: init interrupts\n");
 
     crate::interrupts::enable();

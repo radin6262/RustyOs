@@ -9,6 +9,7 @@ extern crate alloc;
 mod ax_sync;
 mod cpu;
 mod delay;
+mod desktop;
 mod elf;
 mod font;
 mod graphics;
@@ -20,6 +21,7 @@ mod process;
 mod programs;
 mod serial;
 mod syscall;
+mod usb;
 mod user;
 mod wm;
 
@@ -73,7 +75,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let selectors = cpu::gdt::init();
 
-    launch_app::run(selectors, include_bytes!("../../user/terminal/Terminal"));
+    launch_app::run(
+        selectors,
+        desktop::TERMINAL_ELF,
+    );
 
     // Kernel idle loop once boot sequence completes
     halt();
