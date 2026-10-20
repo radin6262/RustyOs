@@ -48,13 +48,14 @@ const MAX_WINDOW_PIXELS: usize = 16 * 1024 * 1024;
 // address of the buffer. `allocate_frame` in the memory allocator
 // relies on the same property.
 //
-// The buffer is intentionally never freed: the kernel heap is a
-// monotonic bump allocator with no reclamation.
+// Whole pages can be reclaimed: `Window::drop` returns the buffer to
+// the allocator's page free list, which a later window or process
+// reuses. Non-page allocations keep the monotonic bump behaviour.
 //
 
 fn allocate_pixel_buffer(
     pixel_count: usize,
-) -> (&'static mut [u32], u64) {
+) -> (&'static mut [u32], u64, usize) {
     let byte_size =
         pixel_count
             .checked_mul(
@@ -142,6 +143,7 @@ fn allocate_pixel_buffer(
     (
         pixels,
         pointer as u64,
+        aligned_size,
     )
 }
 
@@ -167,6 +169,15 @@ pub struct Window {
     /// Physical address of `pixels[0]`.
     pub buffer_physical: u64,
 
+    /// Size of the page aligned allocation backing `pixels`.
+    ///
+    /// Kept so the buffer can be returned to the allocator exactly.
+    pub buffer_alloc_bytes: usize,
+
+    /// Process that created the window, or 0 for a kernel window.
+    /// Closing the window terminates this process.
+    pub owner_pid: u64,
+
     /// Virtual address at which `pixels` is mapped inside the owning
     /// userspace process.
     ///
@@ -177,6 +188,10 @@ pub struct Window {
     pub z_index: usize,
 
     pub title: Vec<u8>,
+
+    /// Hidden behind the minimize button. The window keeps its
+    /// buffer and geometry so it can be restored from the dock.
+    pub minimized: bool,
 }
 
 impl Window {
@@ -191,6 +206,7 @@ impl Window {
         width: usize,
         height: usize,
         z_index: usize,
+        owner_pid: u64,
     ) -> Self {
         assert!(width > 0, "Rusty: window width cannot be zero");
         assert!(height > 0, "Rusty: window height cannot be zero");
@@ -206,6 +222,7 @@ impl Window {
         let (
             pixels,
             buffer_physical,
+            buffer_alloc_bytes,
         ) =
             allocate_pixel_buffer(
                 pixel_count,
@@ -219,10 +236,27 @@ impl Window {
             height,
             pixels,
             buffer_physical,
+            buffer_alloc_bytes,
+            owner_pid,
             buffer_va: 0,
             z_index,
             title: Vec::new(),
+            minimized: false,
         }
+    }
+
+    // ========================================================
+    // Visibility
+    // ========================================================
+
+    /// Whether the compositor should draw this window right now.
+    pub fn is_visible(&self) -> bool {
+        !self.minimized
+    }
+
+    /// Bring the window back after minimizing it.
+    pub fn restore(&mut self) {
+        self.minimized = false;
     }
 
     // ========================================================
@@ -365,5 +399,36 @@ impl Window {
 
     pub fn title(&self) -> &str {
         core::str::from_utf8(&self.title).unwrap_or("")
+    }
+}
+
+// ============================================================
+// Release
+// ============================================================
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        crate::serial::write_str(
+            "WM: release window ",
+        );
+
+        crate::serial::write_hex(self.id);
+
+        crate::serial::write_str(" buffer-bytes=");
+
+        crate::serial::write_hex(
+            self.buffer_alloc_bytes as u64,
+        );
+
+        crate::serial::write_str("\n");
+
+        crate::memory::release_page_block(
+            self.buffer_physical,
+            self.buffer_alloc_bytes,
+        );
+
+        // Drop the slice before the backing pages can be reused, so
+        // the compiler cannot keep a pointer into freed memory alive.
+        self.pixels = &mut [];
     }
 }

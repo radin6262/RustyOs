@@ -12,6 +12,7 @@ use x86_64::{
         Cr3,
         Cr3Flags,
     },
+    PhysAddr,
     registers::rflags::RFlags,
     structures::{
         idt::InterruptStackFrameValue,
@@ -389,6 +390,30 @@ impl ProcessManager {
             })
     }
 
+    fn release_slot(
+        &mut self,
+        pid: u64,
+    ) {
+        for slot
+        in self.processes.iter_mut()
+        {
+            if !slot.occupied {
+                continue;
+            }
+
+            let process =
+                unsafe {
+                    slot.process_ref()
+                };
+
+            if process.pid == pid {
+                slot.occupied = false;
+
+                return;
+            }
+        }
+    }
+
     fn find_next_ready(
         &self,
         current_pid: u64,
@@ -454,6 +479,12 @@ SimpleLock<ProcessManager> =
 static PID_ALLOC:
 AtomicU64 =
     AtomicU64::new(1);
+
+/// Page table the kernel was booted with. Used when the last process
+/// exits, so its address space can be released safely.
+static KERNEL_LEVEL_4:
+AtomicU64 =
+    AtomicU64::new(0);
 
 static INITIALIZED:
 AtomicBool =
@@ -1059,6 +1090,147 @@ pub fn yield_current(
 }
 
 // ============================================================
+// Kernel page table
+// ============================================================
+
+/// Remember the page table the bootloader handed us, before the first
+/// user address space replaces CR3.
+pub fn remember_kernel_page_table() {
+    let (
+        frame,
+        _,
+    ) =
+        Cr3::read();
+
+    KERNEL_LEVEL_4.store(
+        frame
+            .start_address()
+            .as_u64(),
+        Ordering::Release,
+    );
+}
+
+/// Switch back to the kernel page table so a dead process's page
+/// tables can be released safely.
+fn switch_to_kernel_page_table() -> bool {
+    let address =
+        KERNEL_LEVEL_4.load(
+            Ordering::Acquire,
+        );
+
+    if address == 0 {
+        return false;
+    }
+
+    let Some(frame) =
+        PhysFrame::<Size4KiB>
+        ::from_start_address(
+            PhysAddr::new(address),
+        )
+            .ok()
+    else {
+        return false;
+    };
+
+    unsafe {
+        Cr3::write(
+            frame,
+            Cr3Flags::empty(),
+        );
+    }
+
+    true
+}
+
+// ============================================================
+// Terminate a process
+// ============================================================
+
+/// Mark a process as terminated and, when it is not the running
+/// process, release its address space immediately.
+///
+/// The running process is released by `exit_current`, which first
+/// switches CR3 away from its page tables.
+pub fn terminate(
+    pid: u64,
+) -> bool {
+    let mut guard =
+        PROCESS_MANAGER.lock();
+
+    let manager =
+        &mut *guard;
+
+    let is_current =
+        manager.current == Some(pid);
+
+    let level_4 =
+        match manager.find_process_mut(pid) {
+            Some(process)
+                if process.state
+                    != ProcessState::Exited =>
+            {
+                process.state =
+                    ProcessState::Exited;
+
+                process.level_4_frame
+            }
+
+            _ =>
+                return false,
+        };
+
+    crate::serial::write_str(
+        "process: PID=",
+    );
+
+    crate::serial::write_usize(
+        pid as usize,
+    );
+
+    crate::serial::write_str(
+        " terminated\n",
+    );
+
+    if is_current {
+        return true;
+    }
+
+    manager.release_slot(pid);
+
+    drop(guard);
+
+    crate::wm::release_windows_owned_by(
+        pid,
+    );
+
+    crate::memory::release_user_address_space(
+        level_4,
+    );
+
+    true
+}
+
+/// Whether the running process has been terminated by the desktop.
+pub fn current_exited() -> bool {
+    let guard =
+        PROCESS_MANAGER.lock();
+
+    let Some(pid) =
+        guard.current
+    else {
+        return false;
+    };
+
+    guard
+        .find_process(pid)
+        .map(|process| {
+            process.state
+                == ProcessState::Exited
+        })
+        .unwrap_or(true)
+}
+
+// ============================================================
 // Process exit
 // ============================================================
 
@@ -1083,6 +1255,9 @@ pub fn exit_current(
     // Mark process exited.
     // --------------------------------------------------------
 
+    let mut exited_level_4 =
+        None;
+
     if let Some(current) =
         manager.find_process_mut(
             current_pid,
@@ -1090,6 +1265,9 @@ pub fn exit_current(
     {
         current.state =
             ProcessState::Exited;
+
+        exited_level_4 =
+            Some(current.level_4_frame);
     }
 
     crate::serial::write_str(
@@ -1117,68 +1295,103 @@ pub fn exit_current(
     // --------------------------------------------------------
 
     let next_index =
-        match manager.find_next_ready(
+        manager.find_next_ready(
             current_pid,
-        ) {
-            Some(index) => index,
+        );
 
-            None => {
-                manager.current =
-                    None;
+    let result;
 
-                return ScheduleResult::NoProcess;
-            }
-        };
-
-    // --------------------------------------------------------
-    // Select next process.
-    // --------------------------------------------------------
-
-    let next_pid;
-    let next_context;
-    let next_frame;
-
+    if let Some(next_index) =
+        next_index
     {
-        let slot =
-            &mut manager.processes[
-                next_index
-                ];
+        // ----------------------------------------------------
+        // Select next process.
+        // ----------------------------------------------------
 
-        let next =
-            unsafe {
-                slot.process_mut()
-            };
+        let next_pid;
+        let next_context;
+        let next_frame;
 
-        next_pid =
-            next.pid;
+        {
+            let slot =
+                &mut manager.processes[
+                    next_index
+                    ];
 
-        next_context =
-            next.context;
+            let next =
+                unsafe {
+                    slot.process_mut()
+                };
 
-        next_frame =
-            next.level_4_frame;
+            next_pid =
+                next.pid;
 
-        next.state =
-            ProcessState::Running;
+            next_context =
+                next.context;
+
+            next_frame =
+                next.level_4_frame;
+
+            next.state =
+                ProcessState::Running;
+        }
+
+        manager.current =
+            Some(next_pid);
+
+        // Free the dead slot before switching so a later process can
+        // reuse it.
+        manager.release_slot(
+            current_pid,
+        );
+
+        result =
+            ScheduleResult::Switched(
+                next_context,
+            );
+
+        // ----------------------------------------------------
+        // Switch page table away from the dead process.
+        // ----------------------------------------------------
+
+        unsafe {
+            Cr3::write(
+                next_frame,
+                Cr3Flags::empty(),
+            );
+        }
+    } else {
+        manager.current =
+            None;
+
+        manager.release_slot(
+            current_pid,
+        );
+
+        result =
+            ScheduleResult::NoProcess;
+
+        // ----------------------------------------------------
+        // No process left: return to the kernel page table so the
+        // dead process's page tables can be released.
+        // ----------------------------------------------------
+
+        switch_to_kernel_page_table();
     }
 
-    manager.current =
-        Some(next_pid);
+    drop(guard);
 
-    // --------------------------------------------------------
-    // Switch page table.
-    // --------------------------------------------------------
+    crate::wm::release_windows_owned_by(
+        current_pid,
+    );
 
-    unsafe {
-        Cr3::write(
-            next_frame,
-            Cr3Flags::empty(),
+    if let Some(level_4) = exited_level_4 {
+        crate::memory::release_user_address_space(
+            level_4,
         );
     }
 
-    ScheduleResult::Switched(
-        next_context,
-    )
+    result
 }
 
 // ============================================================

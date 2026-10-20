@@ -33,14 +33,30 @@ use crate::wm::window::Window;
 
 pub const MENU_BAR_HEIGHT: i64 = 26;
 
-const MENU_BAR_COLOR: u32 =
-    0x232329;
+/// Blur radius of the frosted glass behind the menu bar.
+const MENU_BAR_BLUR: usize =
+    12;
+
+const MENU_BAR_TOP_COLOR: u32 =
+    0x2C2C35;
+
+const MENU_BAR_BOTTOM_COLOR: u32 =
+    0x1C1C23;
 
 const MENU_BAR_ALPHA: u8 =
-    0xE4;
+    0xD8;
 
 const MENU_BAR_HAIRLINE_ALPHA: u8 =
     0x33;
+
+/// Menu titles shown to the right of the logo, macOS style.
+const MENU_TITLES: &[&str] = &[
+    "File",
+    "Edit",
+    "View",
+    "Window",
+    "Help",
+];
 
 // ============================================================
 // Window frame geometry
@@ -59,10 +75,16 @@ const FRAME_ALPHA: u8 =
     0xFF;
 
 const TITLE_BAR_COLOR: u32 =
-    0x2C2C34;
+    0x2E2E37;
+
+const TITLE_BAR_FOCUSED_COLOR: u32 =
+    0x34343E;
 
 const TITLE_BAR_ALPHA: u8 =
     0xF2;
+
+const TITLE_BAR_SHEEN_ALPHA: u8 =
+    0x12;
 
 const TITLE_BAR_EDGE_ALPHA: u8 =
     0x22;
@@ -89,9 +111,30 @@ const TRAFFIC_LIGHT_FIRST_X: i64 =
 const TRAFFIC_LIGHT_SPACING: i64 =
     22;
 
+/// Pointer radius around a traffic light that activates it. A little
+/// larger than the lens so the buttons stay easy to hit.
+const TRAFFIC_LIGHT_HIT_RADIUS: i64 =
+    9;
+
+/// Window controls, in title bar order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrafficLight {
+    Close,
+    Minimize,
+    Zoom,
+}
+
 /// Rings of shadow under every window.
 const SHADOW_RINGS: usize =
-    7;
+    22;
+
+/// Alpha of the innermost shadow ring; outer rings fade to zero.
+const SHADOW_STRENGTH: i64 =
+    74;
+
+/// How far the shadow is pushed down from the frame.
+const SHADOW_OFFSET_Y: i64 =
+    4;
 
 // ============================================================
 // Dock geometry
@@ -112,11 +155,28 @@ const DOCK_RADIUS: usize =
 const DOCK_MARGIN: usize =
     18;
 
-const DOCK_PANEL_COLOR: u32 =
-    0x141419;
+const DOCK_PANEL_TOP_COLOR: u32 =
+    0x23232B;
+
+const DOCK_PANEL_BOTTOM_COLOR: u32 =
+    0x0C0C10;
 
 const DOCK_PANEL_ALPHA: u8 =
-    0xC8;
+    0xBE;
+
+/// Blur radius of the frosted glass behind the dock.
+const DOCK_BLUR: usize =
+    14;
+
+/// Hover magnification, in percent of the dock item size.
+const DOCK_MAGNIFIED: usize =
+    114;
+
+const DOCK_NEIGHBOUR: usize =
+    106;
+
+const DOCK_SECOND_NEIGHBOUR: usize =
+    102;
 
 const DOCK_ICON_RADIUS: usize =
     14;
@@ -153,6 +213,14 @@ pub struct DockItem {
     pub accent: u32,
 
     pub icon: Icon,
+}
+
+/// The part of a window's state the dock visualizes: a dot marks a
+/// running app, and a dim dot marks a minimized window that a click
+/// will bring back.
+pub struct DockWindowState<'a> {
+    pub title: &'a str,
+    pub minimized: bool,
 }
 
 pub static DOCK_ITEMS: &[DockItem] = &[
@@ -301,6 +369,14 @@ pub struct Chrome {
 
     screen_height:
         usize,
+
+    /// Scratch buffers for the frosted glass blur. Allocated once so
+    /// compositing never touches the kernel allocator.
+    blur_a:
+        Vec<u32>,
+
+    blur_b:
+        Vec<u32>,
 }
 
 impl Chrome {
@@ -312,7 +388,7 @@ impl Chrome {
         screen_width: usize,
         screen_height: usize,
     ) -> Self {
-        let chrome =
+        let mut chrome =
             Self {
                 wallpaper:
                     build_wallpaper(
@@ -323,10 +399,28 @@ impl Chrome {
                 screen_width,
 
                 screen_height,
+
+                blur_a: Vec::new(),
+
+                blur_b: Vec::new(),
             };
 
         let dock =
             chrome.dock_layout();
+
+        let blur_capacity =
+            (screen_width
+                * MENU_BAR_HEIGHT as usize)
+                .max(
+                    dock.width * dock.height,
+                )
+                + 16;
+
+        chrome.blur_a =
+            vec![0u32; blur_capacity];
+
+        chrome.blur_b =
+            vec![0u32; blur_capacity];
 
         crate::serial::write_str(
             "WM: chrome ready menu-bar=",
@@ -385,23 +479,56 @@ impl Chrome {
     // ========================================================
 
     pub fn draw_menu_bar(
-        &self,
+        &mut self,
         surface: &mut Surface,
         focused_title: &str,
     ) {
         let width =
             surface.width() as i64;
 
-        surface.rect(
+        // Frosted glass: blur whatever is behind the bar first, so
+        // windows scrolling underneath read as colour, not detail.
+        surface.blur_rounded(
+            0,
+            0,
+            surface.width(),
+            MENU_BAR_HEIGHT as usize,
+            0,
+            MENU_BAR_BLUR,
+            &mut self.blur_a,
+            &mut self.blur_b,
+        );
+
+        // Vertical tint gradient over the blurred backdrop.
+        for row in 0..MENU_BAR_HEIGHT {
+            let t =
+                (row * 255 / MENU_BAR_HEIGHT) as u32;
+
+            let color =
+                mix(
+                    MENU_BAR_TOP_COLOR,
+                    MENU_BAR_BOTTOM_COLOR,
+                    t,
+                );
+
+            surface.row(
+                0,
+                row,
+                width as usize,
+                color,
+                MENU_BAR_ALPHA,
+            );
+        }
+
+        // Top sheen and bottom hairline give the glass an edge.
+        surface.row(
             0,
             0,
             width as usize,
-            MENU_BAR_HEIGHT as usize,
-            MENU_BAR_COLOR,
-            MENU_BAR_ALPHA,
+            0xFFFFFF,
+            0x14,
         );
 
-        // Hairline along the bottom edge.
         surface.row(
             0,
             MENU_BAR_HEIGHT - 1,
@@ -424,6 +551,32 @@ impl Chrome {
             crate::graphics::Color::WHITE,
             1,
         );
+
+        // Menu titles.
+        let mut menu_x =
+            36
+                + crate::graphics::text_width(
+                    "RustyOS",
+                    1,
+                )
+                + 20;
+
+        for title in MENU_TITLES {
+            surface.text(
+                menu_x,
+                5,
+                title,
+                crate::graphics::Color::TEXT_DIM,
+                1,
+            );
+
+            menu_x +=
+                crate::graphics::text_width(
+                    title,
+                    1,
+                )
+                    + 16;
+        }
 
         // Focused application name, centered like the macOS menu bar.
         if !focused_title.is_empty() {
@@ -453,6 +606,12 @@ impl Chrome {
         let status_y =
             MENU_BAR_HEIGHT / 2;
 
+        self.draw_search(
+            surface,
+            surface.width() as i64 - 96,
+            status_y,
+        );
+
         self.draw_wifi(
             surface,
             surface.width() as i64 - 66,
@@ -464,6 +623,35 @@ impl Chrome {
             surface.width() as i64 - 44,
             status_y,
         );
+    }
+
+    fn draw_search(
+        &self,
+        surface: &mut Surface,
+        center_x: i64,
+        center_y: i64,
+    ) {
+        // Magnifier: a ring plus a diagonal handle.
+        surface.round_stroke(
+            center_x - 5,
+            center_y - 5,
+            9,
+            9,
+            4,
+            0xFFFFFF,
+            0xB0,
+        );
+
+        for step in 0..3 {
+            surface.rect(
+                center_x + 3 + step,
+                center_y + 3 + step,
+                2,
+                2,
+                0xFFFFFF,
+                0xA8,
+            );
+        }
     }
 
     fn draw_logo(
@@ -655,6 +843,101 @@ impl Chrome {
             && x < frame_x + frame_width as i64 - inset
     }
 
+    /// Whether a screen point is inside a window's title bar.
+    pub fn title_bar_contains(
+        window: &Window,
+        x: i64,
+        y: i64,
+    ) -> bool {
+        let (
+            frame_x,
+            frame_y,
+            frame_width,
+            _,
+        ) =
+            Self::frame_rect(
+                window,
+            );
+
+        x >= frame_x
+            && x < frame_x + frame_width as i64
+            && y >= frame_y
+            && y < frame_y + TITLE_BAR_HEIGHT
+    }
+
+    /// Center of one traffic light, in screen coordinates.
+    pub fn traffic_light_center(
+        window: &Window,
+        light: TrafficLight,
+    ) -> (i64, i64) {
+        let (
+            frame_x,
+            frame_y,
+            _,
+            _,
+        ) =
+            Self::frame_rect(
+                window,
+            );
+
+        let index =
+            match light {
+                TrafficLight::Close => 0,
+                TrafficLight::Minimize => 1,
+                TrafficLight::Zoom => 2,
+            } as i64;
+
+        (
+            frame_x
+                + TRAFFIC_LIGHT_FIRST_X
+                + index * TRAFFIC_LIGHT_SPACING,
+            frame_y + TITLE_BAR_HEIGHT / 2,
+        )
+    }
+
+    /// Which traffic light, if any, lies under a screen point.
+    pub fn traffic_light_at(
+        window: &Window,
+        x: i64,
+        y: i64,
+    ) -> Option<TrafficLight> {
+        if !Self::title_bar_contains(
+            window,
+            x,
+            y,
+        ) {
+            return None;
+        }
+
+        for light in [
+            TrafficLight::Close,
+            TrafficLight::Minimize,
+            TrafficLight::Zoom,
+        ] {
+            let (light_x, light_y) =
+                Self::traffic_light_center(
+                    window,
+                    light,
+                );
+
+            let offset_x =
+                x - light_x;
+
+            let offset_y =
+                y - light_y;
+
+            if offset_x * offset_x
+                + offset_y * offset_y
+                <= TRAFFIC_LIGHT_HIT_RADIUS
+                    * TRAFFIC_LIGHT_HIT_RADIUS
+            {
+                return Some(light);
+            }
+        }
+
+        None
+    }
+
     /// Drop shadow and frame background.
     ///
     /// Drawn before the window's content so the compositor can
@@ -675,26 +958,38 @@ impl Chrome {
             );
 
         // ----------------------------------------------------
-        // Shadow: one outline per ring avoids stacking alpha.
+        // Shadow.
+        //
+        // One outline per ring, each thicker than the last: a smooth
+        // falloff replaces the hard bands a handful of rings gave.
         // ----------------------------------------------------
 
         for ring in (1..=SHADOW_RINGS).rev() {
             let grow =
                 ring as i64;
 
+            let t =
+                ring as i64;
+
             let alpha =
-                (30u8).saturating_sub(
-                    (ring as u8) * 4,
-                );
+                SHADOW_STRENGTH
+                    * (SHADOW_RINGS as i64 + 1 - t)
+                    * (SHADOW_RINGS as i64 + 1 - t)
+                    / ((SHADOW_RINGS as i64 + 1)
+                        * (SHADOW_RINGS as i64 + 1));
+
+            if alpha <= 0 {
+                continue;
+            }
 
             surface.round_stroke(
                 frame_x - grow,
-                frame_y - grow + 3,
+                frame_y - grow + SHADOW_OFFSET_Y,
                 frame_width + (grow * 2) as usize,
                 frame_height + (grow * 2) as usize,
                 WINDOW_RADIUS + ring,
                 0x000000,
-                alpha,
+                alpha.min(255) as u8,
             );
         }
 
@@ -721,6 +1016,9 @@ impl Chrome {
         &self,
         surface: &mut Surface,
         window: &Window,
+        focused: bool,
+        hovered_light: Option<TrafficLight>,
+        show_controls: bool,
     ) {
         let (
             frame_x,
@@ -739,14 +1037,41 @@ impl Chrome {
         // underneath it.
         // ----------------------------------------------------
 
+        let bar_color =
+            if focused {
+                TITLE_BAR_FOCUSED_COLOR
+            } else {
+                TITLE_BAR_COLOR
+            };
+
         surface.top_round_rect(
             frame_x,
             frame_y,
             frame_width,
             TITLE_BAR_HEIGHT as usize,
             WINDOW_RADIUS,
-            TITLE_BAR_COLOR,
+            bar_color,
             TITLE_BAR_ALPHA,
+        );
+
+        // Glass sheen: a soft highlight along the top edge that fades
+        // over the first few pixels.
+        surface.row(
+            frame_x + WINDOW_RADIUS as i64,
+            frame_y,
+            frame_width
+                .saturating_sub(2 * WINDOW_RADIUS),
+            0xFFFFFF,
+            0x22,
+        );
+
+        surface.row(
+            frame_x + WINDOW_RADIUS as i64,
+            frame_y + 1,
+            frame_width
+                .saturating_sub(2 * WINDOW_RADIUS),
+            0xFFFFFF,
+            TITLE_BAR_SHEEN_ALPHA,
         );
 
         // Hairline separating the title bar from the content.
@@ -765,6 +1090,13 @@ impl Chrome {
         let light_y =
             frame_y + TITLE_BAR_HEIGHT / 2;
 
+        let light_alpha =
+            if focused {
+                0xFF
+            } else {
+                0xB4
+            };
+
         for (index, color) in [
             TRAFFIC_LIGHT_CLOSE,
             TRAFFIC_LIGHT_MINIMIZE,
@@ -773,15 +1105,130 @@ impl Chrome {
             .into_iter()
             .enumerate()
         {
-            surface.circle(
+            let light_x =
                 frame_x
                     + TRAFFIC_LIGHT_FIRST_X
-                    + index as i64 * TRAFFIC_LIGHT_SPACING,
+                    + index as i64 * TRAFFIC_LIGHT_SPACING;
+
+            // Dark rim for definition against the title bar.
+            surface.circle(
+                light_x,
+                light_y,
+                TRAFFIC_LIGHT_RADIUS + 1,
+                0x000000,
+                0x30,
+            );
+
+            surface.circle(
+                light_x,
                 light_y,
                 TRAFFIC_LIGHT_RADIUS,
                 color,
-                0xFF,
+                light_alpha,
             );
+
+            // Specular highlight, upper left of each lens.
+            surface.circle(
+                light_x - 2,
+                light_y - 2,
+                2,
+                0xFFFFFF,
+                0x48,
+            );
+
+            // macOS only reveals the glyphs while the pointer is over
+            // the title bar. The hovered lens gets a touch more light
+            // and a fully opaque symbol.
+            if show_controls {
+                let is_hovered =
+                    hovered_light
+                        == Some(
+                            match index {
+                                0 => TrafficLight::Close,
+                                1 => TrafficLight::Minimize,
+                                _ => TrafficLight::Zoom,
+                            },
+                        );
+
+                if is_hovered {
+                    surface.circle(
+                        light_x,
+                        light_y,
+                        TRAFFIC_LIGHT_RADIUS,
+                        0xFFFFFF,
+                        0x26,
+                    );
+                }
+
+                let glyph_alpha =
+                    if is_hovered {
+                        0xFF
+                    } else {
+                        0xB8
+                    };
+
+                match index {
+                    // Close: a compact cross.
+                    0 => {
+                        let glyph =
+                            0x5A0F0B;
+
+                        surface.line(
+                            light_x - 3,
+                            light_y - 3,
+                            light_x + 3,
+                            light_y + 3,
+                            glyph,
+                            glyph_alpha,
+                        );
+
+                        surface.line(
+                            light_x - 3,
+                            light_y + 3,
+                            light_x + 3,
+                            light_y - 3,
+                            glyph,
+                            glyph_alpha,
+                        );
+                    }
+
+                    // Minimize: a single horizontal bar.
+                    1 => {
+                        surface.line(
+                            light_x - 3,
+                            light_y,
+                            light_x + 3,
+                            light_y,
+                            0x6B4900,
+                            glyph_alpha,
+                        );
+                    }
+
+                    // Zoom: a plus.
+                    _ => {
+                        let glyph =
+                            0x0B3F0F;
+
+                        surface.line(
+                            light_x - 3,
+                            light_y,
+                            light_x + 3,
+                            light_y,
+                            glyph,
+                            glyph_alpha,
+                        );
+
+                        surface.line(
+                            light_x,
+                            light_y - 3,
+                            light_x,
+                            light_y + 3,
+                            glyph,
+                            glyph_alpha,
+                        );
+                    }
+                }
+            }
         }
 
         // ----------------------------------------------------
@@ -813,7 +1260,11 @@ impl Chrome {
             title_x.max(frame_x + 80) as usize,
             (frame_y + 6) as usize,
             title,
-            crate::graphics::Color::TEXT_DIM,
+            if focused {
+                crate::graphics::Color::WHITE
+            } else {
+                crate::graphics::Color::TEXT_DIM
+            },
             1,
         );
 
@@ -968,10 +1419,11 @@ impl Chrome {
     }
 
     pub fn draw_dock(
-        &self,
+        &mut self,
         surface: &mut Surface,
         mouse_x: i64,
         mouse_y: i64,
+        windows: &[DockWindowState<'_>],
     ) {
         let layout =
             self.dock_layout();
@@ -981,6 +1433,21 @@ impl Chrome {
                 mouse_x,
                 mouse_y,
             );
+
+        // ----------------------------------------------------
+        // Frosted glass backdrop.
+        // ----------------------------------------------------
+
+        surface.blur_rounded(
+            layout.x,
+            layout.y,
+            layout.width,
+            layout.height,
+            DOCK_RADIUS,
+            DOCK_BLUR,
+            &mut self.blur_a,
+            &mut self.blur_b,
+        );
 
         // ----------------------------------------------------
         // Panel shadow.
@@ -1007,18 +1474,60 @@ impl Chrome {
         }
 
         // ----------------------------------------------------
-        // Glass panel.
+        // Glass panel: vertical tint over the blurred backdrop.
         // ----------------------------------------------------
 
-        surface.round_rect(
-            layout.x,
-            layout.y,
-            layout.width,
-            layout.height,
-            DOCK_RADIUS,
-            DOCK_PANEL_COLOR,
-            DOCK_PANEL_ALPHA,
-        );
+        for row in 0..layout.height {
+            let inset =
+                surface::round_row_inset(
+                    row,
+                    layout.height,
+                    DOCK_RADIUS,
+                ) as i64;
+
+            let t =
+                (row * 255
+                    / layout.height.max(1)) as u32;
+
+            let color =
+                mix(
+                    DOCK_PANEL_TOP_COLOR,
+                    DOCK_PANEL_BOTTOM_COLOR,
+                    t,
+                );
+
+            surface.row(
+                layout.x + inset,
+                layout.y + row as i64,
+                layout.width
+                    - 2 * inset as usize,
+                color,
+                DOCK_PANEL_ALPHA,
+            );
+        }
+
+        // Top sheen: a bright rim that sells the glass.
+        for row in 0..2 {
+            let inset =
+                surface::round_row_inset(
+                    row,
+                    layout.height,
+                    DOCK_RADIUS,
+                ) as i64;
+
+            surface.row(
+                layout.x + inset,
+                layout.y + row as i64,
+                layout.width
+                    - 2 * inset as usize,
+                0xFFFFFF,
+                if row == 0 {
+                    0x22
+                } else {
+                    0x10
+                },
+            );
+        }
 
         surface.round_stroke(
             layout.x,
@@ -1027,7 +1536,7 @@ impl Chrome {
             layout.height,
             DOCK_RADIUS,
             0xFFFFFF,
-            0x1E,
+            0x24,
         );
 
         // ----------------------------------------------------
@@ -1071,13 +1580,99 @@ impl Chrome {
                 );
             }
 
+            // macOS style magnification: the hovered item grows and
+            // its neighbours follow with a smaller step.
+            let scale =
+                match hovered {
+                    Some(active) => {
+                        let distance =
+                            index.abs_diff(active);
+
+                        match distance {
+                            0 => DOCK_MAGNIFIED,
+
+                            1 => DOCK_NEIGHBOUR,
+
+                            2 => DOCK_SECOND_NEIGHBOUR,
+
+                            _ => 100,
+                        }
+                    }
+
+                    None => 100,
+                };
+
+            let scaled_size =
+                (layout.item_size * scale / 100)
+                    .max(1);
+
+            // Magnified items grow outwards from their layout slot.
+            let grow =
+                (scaled_size
+                    .saturating_sub(layout.item_size))
+                    / 2;
+
             draw_icon(
                 surface,
                 item,
-                item_x,
-                item_y,
-                layout.item_size,
+                item_x - grow as i64,
+                item_y - grow as i64,
+                scaled_size,
             );
+
+            // Running indicator, macOS style: solid for a visible
+            // window, dim for one that is minimized and can be
+            // restored with a click.
+            let state =
+                windows.iter().find(|window| {
+                    window
+                        .title
+                        .eq_ignore_ascii_case(item.label)
+                });
+
+            if let Some(state) = state {
+                let indicator_x =
+                    item_x + layout.item_size as i64 / 2;
+
+                // Sit in the gap under the tile, like the running
+                // dot of a macOS dock icon.
+                let indicator_y =
+                    item_y
+                        + layout.item_size as i64
+                        + DOCK_ITEM_GAP as i64 / 2;
+
+                surface.circle(
+                    indicator_x,
+                    indicator_y,
+                    3,
+                    0x000000,
+                    0x60,
+                );
+
+                surface.circle(
+                    indicator_x,
+                    indicator_y,
+                    2,
+                    0xFFFFFF,
+                    if state.minimized {
+                        0xC0
+                    } else {
+                        0xE0
+                    },
+                );
+
+                // A hollow dot means minimized: the app is running
+                // but has no window on screen.
+                if state.minimized {
+                    surface.circle(
+                        indicator_x,
+                        indicator_y,
+                        1,
+                        0x000000,
+                        0xD0,
+                    );
+                }
+            }
         }
 
         // ----------------------------------------------------
@@ -1201,9 +1796,32 @@ fn draw_icon(
 
     match item.icon {
         Icon::Terminal => {
+            // A tiny terminal screen with a centred prompt.
+            let screen_width =
+                (unit * 4) as usize;
+
+            let screen_height =
+                (unit * 3) as usize;
+
+            surface.round_stroke(
+                center_x - screen_width as i64 / 2,
+                center_y - screen_height as i64 / 2,
+                screen_width,
+                screen_height,
+                (unit / 2) as usize,
+                white,
+                0xB0,
+            );
+
+            let glyph_width =
+                crate::graphics::text_width(
+                    ">_",
+                    1,
+                ) as i64;
+
             surface.text(
-                (center_x - unit) as usize,
-                (center_y - 8) as usize,
+                (center_x - glyph_width / 2) as usize,
+                (center_y - 7) as usize,
                 ">_",
                 crate::graphics::Color::WHITE,
                 1,
@@ -1381,15 +1999,10 @@ fn draw_icon(
                         _ => (-diagonal, diagonal),
                     };
 
-                let size =
-                    (unit / 2).max(2);
-
-                surface.round_rect(
-                    center_x + offset_x - size / 2,
-                    center_y + offset_y - size / 2,
-                    size as usize,
-                    size as usize,
-                    1,
+                surface.circle(
+                    center_x + offset_x,
+                    center_y + offset_y,
+                    (unit / 2).max(2),
                     white,
                     0xE6,
                 );
@@ -1450,6 +2063,38 @@ fn draw_icon(
 // Helpers
 // ============================================================
 
+/// Linear interpolation between two packed colors, `t` from 0 to 255.
+fn mix(
+    start: u32,
+    end: u32,
+    t: u32,
+) -> u32 {
+    let t =
+        t.min(255);
+
+    let lerp =
+        |start: u32, end: u32| -> u32 {
+            (start as i64
+                + (end as i64 - start as i64) * t as i64 / 255)
+                .clamp(0, 255) as u32
+        };
+
+    surface::argb(
+        lerp(
+            (start >> 16) & 0xFF,
+            (end >> 16) & 0xFF,
+        ),
+        lerp(
+            (start >> 8) & 0xFF,
+            (end >> 8) & 0xFF,
+        ),
+        lerp(
+            start & 0xFF,
+            end & 0xFF,
+        ),
+    )
+}
+
 /// Add a fixed amount of white to a color, clamped per channel.
 fn lighten(
     color: u32,
@@ -1481,13 +2126,63 @@ fn lighten(
 //
 // ============================================================
 
-const WALLPAPER_STOPS: &[(u32, u32, u32)] = &[
-    (0x1A, 0x1A, 0x2E),
-    (0x26, 0x21, 0x4A),
-    (0x39, 0x2A, 0x63),
-    (0x4E, 0x33, 0x6B),
-    (0x6B, 0x3E, 0x66),
-    (0x8A, 0x4C, 0x5C),
+// ============================================================
+// Wallpaper
+// ============================================================
+//
+// A deep night sky with a few soft light sources: indigo in the
+// lower left, magenta top right, a teal wash along the bottom and
+// a small warm glow in the corner. Every blob is additive and
+// smooth, so the result looks like a lit room rather than a
+// striped gradient. A one bit dither hides 8-bit banding.
+
+struct WallpaperBlob {
+    center_x_percent: i64,
+    center_y_percent: i64,
+    radius_percent: i64,
+    red: i64,
+    green: i64,
+    blue: i64,
+    strength: i64,
+}
+
+const WALLPAPER_BLOBS: &[WallpaperBlob] = &[
+    WallpaperBlob {
+        center_x_percent: 14,
+        center_y_percent: 82,
+        radius_percent: 62,
+        red: 84,
+        green: 58,
+        blue: 196,
+        strength: 82,
+    },
+    WallpaperBlob {
+        center_x_percent: 86,
+        center_y_percent: 20,
+        radius_percent: 48,
+        red: 206,
+        green: 72,
+        blue: 132,
+        strength: 66,
+    },
+    WallpaperBlob {
+        center_x_percent: 70,
+        center_y_percent: 96,
+        radius_percent: 44,
+        red: 26,
+        green: 136,
+        blue: 164,
+        strength: 36,
+    },
+    WallpaperBlob {
+        center_x_percent: 98,
+        center_y_percent: 4,
+        radius_percent: 26,
+        red: 255,
+        green: 174,
+        blue: 118,
+        strength: 44,
+    },
 ];
 
 fn build_wallpaper(
@@ -1509,109 +2204,141 @@ fn build_wallpaper(
         return wallpaper;
     }
 
-    let light_x =
-        width as i64;
-    let light_y =
-        0;
+    let span =
+        width.max(height) as i64;
+
+    let half_width =
+        (width as i64) / 2;
+
+    let half_height =
+        (height as i64) / 2;
+
+    // Precompute blob geometry once, so the inner loop is only
+    // arithmetic on the current pixel.
+    let mut blob_geometry =
+        [(0i64, 0i64, 1i64); WALLPAPER_BLOBS.len()];
+
+    for (index, blob) in
+        WALLPAPER_BLOBS.iter().enumerate()
+    {
+        blob_geometry[index] = (
+            width as i64
+                * blob.center_x_percent
+                / 100,
+            height as i64
+                * blob.center_y_percent
+                / 100,
+            (span
+                * blob.radius_percent
+                / 100)
+                .max(1),
+        );
+    }
 
     for y in 0..height {
         for x in 0..width {
-            // Diagonal parameter: brighter toward the top right.
-            let horizontal =
-                (x * 255) / width;
+            // Base: a diagonal wash from deep blue to near black.
+            let diagonal =
+                ((x * 128 / width)
+                    + ((height - 1 - y) * 127 / height))
+                    as u32;
 
-            let vertical =
-                ((height - 1 - y) * 255) / height;
-
-            let position =
-                (horizontal + vertical * 3) / 4;
-
-            let color =
-                sample_stops(
-                    position as u32,
+            let base =
+                mix(
+                    0x10142A,
+                    0x07080F,
+                    diagonal,
                 );
 
-            // Soft glow from the light source. A Chebyshev
-            // distance keeps this cheap enough for a per pixel
-            // pass at boot.
-            let distance =
-                (light_x - x as i64)
-                    .abs()
-                    .max(
-                        (light_y - y as i64).abs(),
-                    );
+            let mut red =
+                ((base >> 16) & 0xFF) as i64;
 
-            let glow =
-                (120i64 - distance / 6)
-                    .max(0) as u32;
+            let mut green =
+                ((base >> 8) & 0xFF) as i64;
 
-            let red =
-                (((color >> 16) & 0xFF) + glow).min(255);
+            let mut blue =
+                (base & 0xFF) as i64;
 
-            let green =
-                (((color >> 8) & 0xFF) + glow * 3 / 4).min(255);
+            // Additive light blobs.
+            for (index, blob) in
+                WALLPAPER_BLOBS.iter().enumerate()
+            {
+                let (center_x, center_y, radius) =
+                    blob_geometry[index];
 
-            let blue =
-                ((color & 0xFF) + glow / 3).min(255);
+                let dx =
+                    x as i64 - center_x;
+
+                let dy =
+                    y as i64 - center_y;
+
+                let distance_squared =
+                    dx * dx + dy * dy;
+
+                let radius_squared =
+                    radius * radius;
+
+                if distance_squared >= radius_squared {
+                    continue;
+                }
+
+                // Smooth falloff: quadratic in the normalized
+                // distance, zero at the edge of the blob.
+                let falloff =
+                    (radius_squared - distance_squared)
+                        * 256
+                        / radius_squared;
+
+                let falloff =
+                    falloff * falloff / 256;
+
+                let amount =
+                    falloff * blob.strength / 256;
+
+                red += blob.red * amount / 100;
+                green += blob.green * amount / 100;
+                blue += blob.blue * amount / 100;
+            }
+
+            // Vignette: darken the corners so the centre reads as
+            // the focal point.
+            let dx =
+                (x as i64 - half_width) * 256
+                    / half_width.max(1);
+
+            let dy =
+                (y as i64 - half_height) * 256
+                    / half_height.max(1);
+
+            let vignette =
+                256
+                    - (dx * dx + dy * dy)
+                        .min(512 * 512)
+                        * 64
+                        / (512 * 512);
+
+            red = red * vignette / 256;
+            green = green * vignette / 256;
+            blue = blue * vignette / 256;
+
+            // Ordered hash dither, ±1 per channel.
+            let noise =
+                (((x as u32)
+                    .wrapping_mul(0x9E37_79B1)
+                    ^ (y as u32)
+                        .wrapping_mul(0x85EB_CA6B))
+                    >> 13
+                    & 3) as i64
+                    - 2;
 
             wallpaper[y * width + x] =
                 surface::argb(
-                    red,
-                    green,
-                    blue,
+                    (red + noise).clamp(0, 255) as u32,
+                    (green + noise).clamp(0, 255) as u32,
+                    (blue + noise).clamp(0, 255) as u32,
                 );
         }
     }
 
     wallpaper
-}
-
-fn sample_stops(
-    position: u32,
-) -> u32 {
-    let last =
-        WALLPAPER_STOPS.len() - 1;
-
-    let scaled =
-        (position.min(255) as usize)
-            * last;
-
-    let index =
-        (scaled / 255)
-            .min(last - 1);
-
-    let fraction =
-        (scaled % 255) as i64;
-
-    let (
-        start_red,
-        start_green,
-        start_blue,
-    ) = WALLPAPER_STOPS[index];
-
-    let (
-        end_red,
-        end_green,
-        end_blue,
-    ) = WALLPAPER_STOPS[index + 1];
-
-    let lerp =
-        |start: u32, end: u32| -> u32 {
-            let value =
-                start as i64
-                    + (end as i64 - start as i64)
-                        * fraction
-                        / 255;
-
-            value.clamp(
-                0,
-                255,
-            ) as u32
-        };
-
-    surface::argb(
-        lerp(start_red, end_red),
-        lerp(start_green, end_green),
-        lerp(start_blue, end_blue),
-    )
 }

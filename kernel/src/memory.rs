@@ -47,6 +47,9 @@ pub use allocator::{
     copy_to_frame,
     physical_memory_offset,
     physical_to_virtual,
+    release_page_block,
+    release_page_table_frame,
+    release_user_address_space,
     virtual_to_physical,
     zero_frame,
 };

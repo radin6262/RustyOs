@@ -484,7 +484,16 @@ async function main() {
         // Shared buffer mapping
         // ----------------------------------------------------
 
-        const log = await waitForSerial('SHARED MEM: window 0x', 30_000);
+        let log = await waitForSerial('SHARED MEM: window 0x', 30_000);
+
+        // The marker can be observed while the rest of the line is
+        // still being written; wait for the line terminator before
+        // matching it.
+        if (log !== null) {
+            await waitForSerial(' BACKED', 5_000);
+
+            log = readSerial();
+        }
 
         check(
             'kernel maps a shared buffer for the window',
@@ -903,6 +912,243 @@ async function main() {
         );
 
         writePng(path.join(OUT_DIR, 'screen-hover.png'), hovered);
+
+        // ----------------------------------------------------
+        // Window controls: minimize with the yellow light,
+        // restore from the dock, then close with the red light.
+        // ----------------------------------------------------
+
+        const movePointer = async (dx, dy) => {
+            let remainingX = Math.round(dx);
+            let remainingY = Math.round(dy);
+
+            while (remainingX !== 0 || remainingY !== 0) {
+                const stepX = Math.max(-95, Math.min(95, remainingX));
+                const stepY = Math.max(-95, Math.min(95, remainingY));
+
+                await qmp.command('input-send-event', {
+                    events: [
+                        { type: 'rel', data: { axis: 'x', value: stepX } },
+                        { type: 'rel', data: { axis: 'y', value: stepY } },
+                    ],
+                });
+
+                remainingX -= stepX;
+                remainingY -= stepY;
+
+                await sleep(35);
+            }
+        };
+
+        const clickLeft = async () => {
+            await qmp.command('input-send-event', {
+                events: [{ type: 'btn', data: { down: true, button: 'left' } }],
+            });
+
+            await sleep(80);
+
+            await qmp.command('input-send-event', {
+                events: [{ type: 'btn', data: { down: false, button: 'left' } }],
+            });
+        };
+
+        const windowHidden = (frame) =>
+            countPixels(frame, WINDOW_INSIDE, (pixel) => sameColor(pixel, COLOR_BLACK)) < 1000;
+
+        const titleBarCenterY = WINDOW_Y - TITLE_BAR_HEIGHT + TITLE_BAR_HEIGHT / 2;
+
+        const closeButton = { x: WINDOW_X + 18, y: titleBarCenterY };
+        const minimizeButton = { x: WINDOW_X + 40, y: titleBarCenterY };
+        const terminalDockIcon = { x: dock.x + dock.width / 2, y: dock.y + 40 };
+
+        // The hover check left the pointer at the dock's center.
+        const dockCenterX = dock.x + dock.width / 2;
+
+        // Minimize. First force a composite with a keystroke so the
+        // title bar's hover glyphs are on screen for the capture.
+        await movePointer(minimizeButton.x - dockCenterX, minimizeButton.y - before.height / 2);
+
+        await sendKey(true);
+        await sleep(60);
+        await sendKey(false);
+
+        // The close glyph is dark maroon on the red lens: it is the
+        // only reddish-dark pixel inside this tiny box.
+        // Keep the box clear of the lens rim: only the dark cross
+        // inside the red lens can satisfy this predicate.
+        const closeGlyphBox = {
+            x: closeButton.x - 3,
+            y: closeButton.y - 3,
+            width: 7,
+            height: 7,
+        };
+
+        const isCloseGlyph = (pixel) =>
+            pixel[0] - pixel[1] > 35 && brightness(pixel) < 120;
+
+        const controlsFrame = await pollFrame(
+            qmp,
+            'controls.ppm',
+            (frame) => countPixels(frame, closeGlyphBox, isCloseGlyph) > 3,
+            15_000,
+        );
+
+        check(
+            'hovering the title bar reveals the control glyphs',
+            controlsFrame.matched,
+            controlsFrame.matched
+                ? 'close, minimize and zoom symbols are drawn'
+                : 'no control glyphs appeared over the traffic lights',
+        );
+
+        if (controlsFrame.matched) {
+            writePng(path.join(OUT_DIR, 'screen-controls.png'), controlsFrame.image);
+        }
+
+        await clickLeft();
+
+        const minimizedFrame = await pollFrame(qmp, 'minimized.ppm', windowHidden, 15_000);
+
+        check(
+            'yellow traffic light minimizes the window',
+            minimizedFrame.matched,
+            minimizedFrame.matched
+                ? 'window removed from the desktop, buffer kept'
+                : 'window is still visible after the minimize click',
+        );
+
+        if (minimizedFrame.matched) {
+            writePng(path.join(OUT_DIR, 'screen-minimized.png'), minimizedFrame.image);
+        }
+
+        // Restore by clicking the Terminal icon in the dock.
+        await movePointer(
+            terminalDockIcon.x - minimizeButton.x,
+            terminalDockIcon.y - minimizeButton.y,
+        );
+        await clickLeft();
+
+        const restoredFrame = await pollFrame(qmp, 'restored.ppm', windowDrawn, 15_000);
+
+        check(
+            'dock icon restores the minimized window',
+            restoredFrame.matched,
+            restoredFrame.matched
+                ? 'Terminal window is visible again'
+                : 'clicking the dock did not bring the window back',
+        );
+
+        // Close.
+        await movePointer(
+            closeButton.x - terminalDockIcon.x,
+            closeButton.y - terminalDockIcon.y,
+        );
+        await clickLeft();
+
+        const closedFrame = await pollFrame(qmp, 'closed.ppm', windowHidden, 15_000);
+
+        check(
+            'red traffic light closes the window',
+            closedFrame.matched,
+            closedFrame.matched
+                ? 'window removed from the desktop'
+                : 'window is still visible after the close click',
+        );
+
+        if (closedFrame.matched) {
+            writePng(path.join(OUT_DIR, 'screen-closed.png'), closedFrame.image);
+        }
+
+        // ----------------------------------------------------
+        // Closing must quit the process and return its memory,
+        // not just hide the window.
+        // ----------------------------------------------------
+
+        const quitLog = readSerial();
+
+        check(
+            'closing quits the owning process',
+            /process: PID=0x[0-9a-f]+ (terminated|exited)/i.test(quitLog),
+            quitLog.match(/process: PID=0x[0-9a-f]+[^\n]*/i)?.[0] ?? 'no process exit in the serial log',
+        );
+
+        const releasedWindow = quitLog.match(
+            /WM: release window 0x[0-9a-f]+ buffer-bytes=0x([0-9a-f]+)/i,
+        );
+
+        check(
+            'closing returns the window buffer to the allocator',
+            releasedWindow !== null && Number(`0x${releasedWindow[1]}`) >= 4096,
+            releasedWindow === null
+                ? 'no window buffer release in the serial log'
+                : `released ${Number(`0x${releasedWindow[1]}`)} bytes`,
+        );
+
+        const releasedSpace = quitLog.match(
+            /MEM: released address space pages=0x([0-9a-f]+)/i,
+        );
+
+        check(
+            'closing releases the process address space',
+            releasedSpace !== null && Number(`0x${releasedSpace[1]}`) > 0,
+            releasedSpace === null
+                ? 'no address-space release in the serial log'
+                : `${Number(`0x${releasedSpace[1]}`)} pages returned`,
+        );
+
+        // ----------------------------------------------------
+        // The idle desktop must still be alive: clicking the
+        // Terminal dock icon starts a fresh process.
+        // ----------------------------------------------------
+
+        await movePointer(
+            terminalDockIcon.x - closeButton.x,
+            terminalDockIcon.y - closeButton.y,
+        );
+        await clickLeft();
+
+        const relaunchedFrame = await pollFrame(qmp, 'relaunched.ppm', windowDrawn, 25_000);
+
+        check(
+            'idle desktop relaunches Terminal from the dock',
+            relaunchedFrame.matched && readSerial().includes('DESKTOP: launching terminal'),
+            relaunchedFrame.matched
+                ? 'a new Terminal window is visible after the quit'
+                : 'no window appeared after clicking Terminal in the dock',
+        );
+
+        if (relaunchedFrame.matched) {
+            writePng(path.join(OUT_DIR, 'screen-relaunched.png'), relaunchedFrame.image);
+        }
+
+        // The fresh window must get its pixels back from the block the
+        // closed window returned, which proves the RAM was reclaimed
+        // rather than merely hidden.
+        const mappings = [
+            ...readSerial().matchAll(
+                /SHARED MEM: window 0x[0-9a-f]+ VA=0x[0-9a-f]+ PA=(0x[0-9a-f]+)/gi,
+            ),
+        ].map((match) => match[1]);
+
+        check(
+            'the released window buffer is reused by the new process',
+            mappings.length >= 2 && mappings.at(-1) === mappings[0],
+            mappings.length >= 2
+                ? `first PA ${mappings[0]}, relaunched PA ${mappings.at(-1)}`
+                : 'the relaunched window never mapped a buffer',
+        );
+
+        const pageTables = [
+            ...readSerial().matchAll(/CR3=(0x[0-9a-f]+) RIP=/gi),
+        ].map((match) => match[1]);
+
+        check(
+            'the released page tables are reused by the new process',
+            pageTables.length >= 2 && pageTables.at(-1) === pageTables[0],
+            pageTables.length >= 2
+                ? `first CR3 ${pageTables[0]}, relaunched CR3 ${pageTables.at(-1)}`
+                : 'the relaunched process never entered Ring 3',
+        );
     } finally {
         if (qmp) {
             qmp.close();
@@ -940,7 +1186,16 @@ async function main() {
     }
 
     if (!KEEP) {
-        for (const frame of ['before.ppm', 'after.ppm', 'hover.ppm']) {
+        for (const frame of [
+            'before.ppm',
+            'after.ppm',
+            'hover.ppm',
+            'controls.ppm',
+            'minimized.ppm',
+            'restored.ppm',
+            'closed.ppm',
+            'relaunched.ppm',
+        ]) {
             fs.rmSync(path.join(OUT_DIR, frame), { force: true });
         }
     }
@@ -948,7 +1203,10 @@ async function main() {
     console.log('');
     console.log('All desktop checks passed.');
     console.log(`serial log: ${SERIAL_LOG}`);
-    console.log(`screenshots: ${path.join(OUT_DIR, 'screen.png')}, ${path.join(OUT_DIR, 'screen-hover.png')}`);
+    console.log(
+        `screenshots: ${path.join(OUT_DIR, 'screen.png')}, ${path.join(OUT_DIR, 'screen-hover.png')}, ` +
+            `${path.join(OUT_DIR, 'screen-closed.png')}, ${path.join(OUT_DIR, 'screen-relaunched.png')}`,
+    );
 }
 
 main().catch((error) => {

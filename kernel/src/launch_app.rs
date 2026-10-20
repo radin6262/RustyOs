@@ -27,6 +27,17 @@ pub fn run(
     process::init();
 
     // ========================================================
+    // Remember the kernel page table
+    // ========================================================
+    //
+    // Everything below switches CR3 to a user address space. Keeping
+    // the boot table lets the idle desktop switch back after the last
+    // process exits, so the dead page tables can be released.
+    // ========================================================
+
+    process::remember_kernel_page_table();
+
+    // ========================================================
     // Create address space
     // ========================================================
 

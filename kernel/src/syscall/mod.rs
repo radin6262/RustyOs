@@ -332,6 +332,11 @@ rusty_syscall_switch:
 rusty_syscall_halt:
     cli
 
+    // No userspace process is left: hand control to the idle
+    // desktop, which keeps input and compositing alive and can
+    // relaunch Terminal from the dock.
+    call rusty_desktop_idle
+
 rusty_syscall_halt_loop:
     hlt
     jmp rusty_syscall_halt_loop
@@ -352,18 +357,40 @@ extern "C" fn rusty_syscall_dispatch(
     interrupt: *mut UserInterruptFrame,
 ) -> u64 {
     // --------------------------------------------------------
-    // Service physical mouse input.
+    // Service input backends.
     //
-    // PS/2 input arrives through the IRQ1/IRQ12 handlers, so there is no
-    // backend to pump on this path. The compositor consumes the queued
-    // mouse events and updates only the cursor region.
+    // PS/2 input arrives through IRQ1/IRQ12. USB is polled: draining the
+    // xHCI event ring here decodes completed HID reports, pushes them into
+    // the same input queues, and re-arms the interrupt transfers. The
+    // compositor then consumes the queued mouse events and updates only the
+    // cursor region.
     // --------------------------------------------------------
+
+    crate::usb::poll();
 
     service_mouse();
 
     let frame = unsafe { &mut *frame };
 
     let interrupt = unsafe { &mut *interrupt };
+
+    // --------------------------------------------------------
+    // The desktop may have closed this process's window while the
+    // mouse was serviced. Quit before the syscall itself runs so the
+    // application never touches its released buffers again.
+    // --------------------------------------------------------
+
+    if crate::process::current_exited() {
+        return match crate::process::exit_current(0) {
+            ScheduleResult::Switched(context) => {
+                load_context(context, frame, interrupt);
+
+                SYSCALL_SWITCH
+            }
+
+            ScheduleResult::NoProcess => SYSCALL_HALT,
+        };
+    }
 
     match frame.rax {
         SYS_EXIT => syscall_exit(frame, interrupt),
@@ -1132,12 +1159,21 @@ fn syscall_create_window(frame: &SyscallFrame) -> u64 {
 
     let height = frame.r10 as usize;
 
+    let owner_pid =
+        crate::process::current_pid().unwrap_or(0);
+
     let window_id = {
         let mut wm_lock = crate::wm::WM.lock();
 
         match *wm_lock {
             Some(ref mut compositor) =>
-                compositor.create_window(x, y, width, height),
+                compositor.create_window(
+                    x,
+                    y,
+                    width,
+                    height,
+                    owner_pid,
+                ),
 
             None =>
                 0,
@@ -1753,15 +1789,43 @@ fn syscall_launch_app(frame: &SyscallFrame) -> ! {
 //
 
 fn service_mouse() {
-    let mut wm_lock = crate::wm::WM.lock();
+    let mut exit_pid = None;
 
-    let Some(ref mut wm) = *wm_lock else {
-        return;
-    };
+    {
+        let mut wm_lock = crate::wm::WM.lock();
 
-    if wm.update_mouse() {
-        wm.update_cursor_only();
+        let Some(ref mut wm) = *wm_lock else {
+            return;
+        };
+
+        if wm.update_mouse() {
+            // Window controls, focus changes and dock clicks need a
+            // real composite; plain pointer motion only repaints the
+            // cursor.
+            if wm.take_chrome_redraw() {
+                wm.draw();
+            } else {
+                wm.update_cursor_only();
+            }
+        }
+
+        exit_pid =
+            wm.take_exit_pid();
     }
+
+    // Terminating a process releases its address space, so it must
+    // happen after the compositor lock is gone.
+    if let Some(pid) = exit_pid {
+        crate::process::terminate(pid);
+    }
+}
+
+/// Input tick for the idle desktop, which has no userspace process to
+/// poll the mouse and present frames.
+pub fn service_idle_input() {
+    crate::usb::poll();
+
+    service_mouse();
 }
 
 // ============================================================

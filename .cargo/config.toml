@@ -1,2 +1,20 @@
 [unstable]
 bindeps = true
+
+# Windows Defender (real-time scanning) intermittently denies `link.exe`
+# access to the temporary files it creates under %TEMP%, which surfaces as
+#     LINK : fatal error LNK1104: cannot open file ...lnk{GUID}.tmp
+# during the bootloader's nested build. Pointing TMP/TEMP at the project's
+# own target directory keeps those files inside the build tree.
+#
+# The `bootloader` build script also runs `cargo install bootloader-x86_64-uefi`.
+# That nested Cargo process would otherwise create its temporary build
+# directory (`target-installNNN`) inside the crate source directory under
+# CARGO_HOME, which fails with "Access is denied" as well.
+#
+# `[env]` only applies to build scripts and the tools they spawn, so the main
+# build keeps using `target/` while the nested install builds here.
+[env]
+CARGO_TARGET_DIR = { value = "target/build-scripts", relative = true }
+TMP = { value = "target", relative = true, force = true }
+TEMP = { value = "target", relative = true, force = true }
