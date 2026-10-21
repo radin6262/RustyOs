@@ -79,6 +79,11 @@ pub fn run_boot_sequence(boot_info: &'static mut BootInfo) {
     crate::delay::init();
     serial::write_str("Delay system calibrated\n");
 
+    // The idle desktop sleeps in `hlt` and needs a periodic wake-up to poll
+    // USB. Start the local APIC timer now that the TSC is calibrated; the
+    // PIT tick stays enabled as a second wake source.
+    crate::interrupts::init_apic_timer();
+
     // ========================================================
     // System Boot Screen (Compositor Controlled)
     // ========================================================

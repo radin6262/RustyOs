@@ -27,6 +27,7 @@ const BIOS = 'C:\\Program Files\\qemu\\OVMF.fd';
 const OUT_DIR = path.join(REPO, 'target', 'usb-hid-test');
 const SERIAL_LOG = path.join(OUT_DIR, 'serial.log');
 const SCREENSHOT = path.join(OUT_DIR, 'screen.ppm');
+const IDLE_SCREENSHOT = path.join(OUT_DIR, 'screen-idle.ppm');
 
 const QMP_PORT = 45462;
 
@@ -299,6 +300,73 @@ async function main() {
             'absolute coordinates move the cursor to the scaled position',
             cursorPixels > 10 && centerPixels === 0,
             `cursor box ${cursorPixels} bright pixels, centre box ${centerPixels}`,
+        );
+
+        // ----------------------------------------------------
+        // The idle desktop must keep polling USB after the last
+        // application quits.
+        //
+        // The xHCI driver runs in polled mode (no interrupter), so a
+        // sleeping CPU would never see another USB report. Closing
+        // Terminal must leave a desktop whose pointer still moves.
+        // ----------------------------------------------------
+
+        const sendAbsolute = async (x, y) => {
+            await qmp.command('input-send-event', {
+                events: [
+                    {
+                        type: 'abs',
+                        data: {
+                            axis: 'x',
+                            value: Math.round((x / image.width) * 32767),
+                        },
+                    },
+                    {
+                        type: 'abs',
+                        data: {
+                            axis: 'y',
+                            value: Math.round((y / image.height) * 32767),
+                        },
+                    },
+                ],
+            });
+        };
+
+        const sendButton = async (down) => {
+            await qmp.command('input-send-event', {
+                events: [{ type: 'btn', data: { down, button: 'left' } }],
+            });
+        };
+
+        // Terminal's red traffic light: (290 + 18, 175 - 30 + 15).
+        await sendAbsolute(308, 160);
+        await sleep(400);
+        await sendButton(true);
+        await sleep(80);
+        await sendButton(false);
+
+        await waitForSerial(/DESKTOP: idle/, 30_000, 'idle desktop');
+
+        const idleX = 300;
+        const idleY = 650;
+
+        await sendAbsolute(idleX, idleY);
+        await sleep(1500);
+
+        await qmp.command('screendump', { filename: IDLE_SCREENSHOT });
+
+        const idleImage = parsePpm(IDLE_SCREENSHOT);
+
+        const idleCursor = { x: idleX - 4, y: idleY - 4, width: 30, height: 30 };
+        const oldCursor = { x: 308 - 4, y: 160 - 4, width: 30, height: 30 };
+
+        const movedPixels = countBright(idleImage, idleCursor);
+        const stalePixels = countBright(idleImage, oldCursor);
+
+        check(
+            'USB pointer still moves on the idle desktop after the app quits',
+            movedPixels > 10 && stalePixels === 0,
+            `${movedPixels} bright pixels at the new position, ${stalePixels} at the old one`,
         );
     } catch (error) {
         check('test completed without a harness error', false, error.message);

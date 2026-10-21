@@ -21,6 +21,7 @@ mod process;
 mod programs;
 mod serial;
 mod syscall;
+mod timer;
 mod usb;
 mod user;
 mod wm;
