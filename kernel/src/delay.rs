@@ -93,6 +93,12 @@ fn get_tsc_mhz() -> u64 {
     *TSC_MHZ.get().unwrap_or(&3000)
 }
 
+/// TSC cycles in one millisecond, for the local APIC TSC-deadline timer.
+#[inline(always)]
+pub fn cycles_per_ms() -> u64 {
+    get_tsc_mhz().max(1).saturating_mul(1000)
+}
+
 /// Returns the calibrated TSC-derived timestamp in microseconds.
 ///
 /// The value is intended for monotonic deadline comparisons inside the

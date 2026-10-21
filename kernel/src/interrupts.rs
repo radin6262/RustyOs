@@ -30,6 +30,9 @@ pub const APIC_SPURIOUS_VECTOR: u8 = 0xFF;
 // PS/2 interrupt lines
 // ============================================================
 
+/// IRQ0: the 8254 PIT that drives the kernel tick.
+pub const IRQ_TIMER: u8 = PIC_1_OFFSET;
+
 /// IRQ1: PS/2 keyboard.
 pub const IRQ_KEYBOARD: u8 = PIC_1_OFFSET + 1;
 
@@ -41,9 +44,12 @@ const IRQ_CASCADE: u8 = PIC_1_OFFSET + 2;
 pub const IRQ_MOUSE: u8 = PIC_2_OFFSET + 4;
 
 /// Masks written to the 8259 PICs. Bit N of the master mask covers IRQ N;
-/// bit N of the slave mask covers IRQ N + 8. Everything else, including the
-/// unused PIT line, stays masked.
+/// bit N of the slave mask covers IRQ N + 8. Everything else stays masked.
+///
+/// IRQ0 is the periodic kernel tick, which keeps the idle desktop waking up
+/// so it can poll the USB stack.
 const MASTER_IRQ_MASK: u8 = 0xFF
+    & !(1u8 << (IRQ_TIMER - PIC_1_OFFSET))
     & !(1u8 << (IRQ_KEYBOARD - PIC_1_OFFSET))
     & !(1u8 << (IRQ_CASCADE - PIC_1_OFFSET));
 
@@ -103,9 +109,38 @@ const APIC_BASE_ADDRESS_MASK: u64 = 0xFFFF_FFFF_FFFF_F000;
 
 const APIC_ID_OFFSET: usize = 0x020;
 const APIC_SVR_OFFSET: usize = 0x0F0;
+const APIC_EOI_OFFSET: usize = 0x0B0;
+const APIC_LVT_TIMER_OFFSET: usize = 0x320;
+const APIC_TIMER_INITIAL_OFFSET: usize = 0x380;
+const APIC_TIMER_DIVIDE_OFFSET: usize = 0x3E0;
 
 const APIC_SVR_ENABLE: u32 = 1 << 8;
 const APIC_SVR_VECTOR_MASK: u32 = 0xFF;
+
+// ============================================================
+// Local APIC timer
+// ============================================================
+
+/// Vector for the local APIC timer. Outside the remapped PIC range.
+pub const APIC_TIMER_VECTOR: u8 = 0x40;
+
+const IA32_X2APIC_EOI: u32 = 0x80B;
+const IA32_X2APIC_LVT_TIMER: u32 = 0x832;
+const IA32_X2APIC_TIMER_INITIAL: u32 = 0x838;
+const IA32_X2APIC_TIMER_DIVIDE: u32 = 0x83E;
+const IA32_TSC_DEADLINE: u32 = 0x6E0;
+
+/// LVT timer mode bits 17-18: `01` periodic, `10` TSC deadline.
+const APIC_LVT_MODE_PERIODIC: u32 = 1 << 17;
+const APIC_LVT_MODE_TSC_DEADLINE: u32 = 2 << 17;
+
+/// Fallback periodic count. Exact rate does not matter: the tick only has
+/// to wake the idle desktop often enough to poll USB. At the usual
+/// 100-200 MHz APIC bus clock divided by 16 this is roughly 4-8 ms.
+const APIC_TIMER_PERIODIC_COUNT: u32 = 50_000;
+
+static APIC_TIMER_READY: AtomicBool = AtomicBool::new(false);
+static APIC_TIMER_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 
 // ============================================================
 // Raw MSR helpers
@@ -222,6 +257,103 @@ unsafe fn init_local_apic() {
 }
 
 // ============================================================
+// Local APIC timer
+// ============================================================
+//
+// PIC IRQ0 is not available on every machine (firmware may leave the PIT
+// unrouted), and the idle desktop needs a wake-up source to poll USB. The
+// local APIC timer is delivered directly to the CPU, so it is used when
+// available; the PIT tick remains as a second wake source.
+
+fn apic_write(offset: usize, x2apic_msr: u32, value: u32) {
+    if LOCAL_APIC_X2APIC.load(Ordering::Acquire) {
+        unsafe {
+            write_msr(x2apic_msr, value as u64);
+        }
+    } else {
+        let base = LOCAL_APIC_BASE.load(Ordering::Acquire) as usize;
+
+        unsafe {
+            write_volatile((base + offset) as *mut u32, value);
+        }
+    }
+}
+
+fn lapic_eoi() {
+    if LOCAL_APIC_X2APIC.load(Ordering::Acquire) {
+        unsafe {
+            write_msr(IA32_X2APIC_EOI, 0);
+        }
+    } else {
+        let base = LOCAL_APIC_BASE.load(Ordering::Acquire) as usize;
+
+        unsafe {
+            write_volatile((base + APIC_EOI_OFFSET) as *mut u32, 0);
+        }
+    }
+}
+
+fn rearm_tsc_deadline() {
+    let deadline =
+        unsafe { core::arch::x86_64::_rdtsc() }.saturating_add(crate::delay::cycles_per_ms());
+
+    unsafe {
+        write_msr(IA32_TSC_DEADLINE, deadline);
+    }
+}
+
+/// Start a periodic wake-up source on the local APIC.
+///
+/// Call after `crate::delay::init()`, because the TSC deadline mode needs
+/// the calibrated TSC frequency.
+pub fn init_apic_timer() {
+    if APIC_TIMER_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    if !LOCAL_APIC_READY.load(Ordering::Acquire) {
+        serial::write_str("APIC timer: unavailable, falling back to PIT\n");
+        return;
+    }
+
+    let vector = APIC_TIMER_VECTOR as u32;
+    let tsc_deadline = unsafe { __cpuid(1) }.ecx & (1 << 24) != 0;
+
+    if tsc_deadline {
+        APIC_TIMER_TSC_DEADLINE.store(true, Ordering::Release);
+
+        apic_write(
+            APIC_LVT_TIMER_OFFSET,
+            IA32_X2APIC_LVT_TIMER,
+            vector | APIC_LVT_MODE_TSC_DEADLINE,
+        );
+
+        rearm_tsc_deadline();
+
+        serial::write_str("APIC timer: TSC deadline mode\n");
+    } else {
+        APIC_TIMER_TSC_DEADLINE.store(false, Ordering::Release);
+
+        // Divide by 16, periodic mode.
+        apic_write(APIC_TIMER_DIVIDE_OFFSET, IA32_X2APIC_TIMER_DIVIDE, 0x3);
+        apic_write(
+            APIC_LVT_TIMER_OFFSET,
+            IA32_X2APIC_LVT_TIMER,
+            vector | APIC_LVT_MODE_PERIODIC,
+        );
+        apic_write(
+            APIC_TIMER_INITIAL_OFFSET,
+            IA32_X2APIC_TIMER_INITIAL,
+            APIC_TIMER_PERIODIC_COUNT,
+        );
+
+        serial::write_str("APIC timer: periodic mode\n");
+    }
+
+    APIC_TIMER_READY.store(true, Ordering::Release);
+}
+
+// ============================================================
 // Initialize IDT + PIC + LAPIC
 // ============================================================
 
@@ -234,6 +366,9 @@ pub fn init() {
     idt.double_fault.set_handler_fn(double_fault_handler);
 
     idt[PIC_1_OFFSET].set_handler_fn(timer_interrupt_handler);
+
+    // Local APIC timer: an independent wake-up source for the idle desktop.
+    idt[APIC_TIMER_VECTOR].set_handler_fn(apic_timer_interrupt_handler);
 
     // PS/2 input lines.
     idt[IRQ_KEYBOARD].set_handler_fn(keyboard_interrupt_handler);
@@ -267,6 +402,11 @@ pub fn init() {
         pics.write_masks(MASTER_IRQ_MASK, SLAVE_IRQ_MASK);
     }
 
+    // Program the PIT before IRQ0 can reach the CPU. Interrupts are
+    // still disabled here, so the first tick arrives only after the
+    // boot sequence enables them.
+    crate::timer::init();
+
     unsafe {
         init_local_apic();
     }
@@ -289,8 +429,24 @@ pub fn disable() {
 // ============================================================
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::timer::tick();
+
     unsafe {
-        PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET);
+        PICS.lock().notify_end_of_interrupt(IRQ_TIMER);
+    }
+}
+
+// ============================================================
+// Local APIC timer interrupt
+// ============================================================
+
+extern "x86-interrupt" fn apic_timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::timer::tick();
+
+    lapic_eoi();
+
+    if APIC_TIMER_TSC_DEADLINE.load(Ordering::Acquire) {
+        rearm_tsc_deadline();
     }
 }
 
