@@ -2,9 +2,7 @@
 
 RustyOS is a lightweight hobby operating system written in Rust.
 
-> Warning as of now keyboards and mice that expose a HID boot interface are
-> supported over both USB and PS/2. Touchpads and devices that only speak a
-> custom HID report format are not supported.
+> XHCI and PS/2 support are fully built. remember usb 3.0 and 4.0 hubs still dont work!
 
 
 ## Features
